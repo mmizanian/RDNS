@@ -1,3 +1,39 @@
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║              NETWORK AVAILABILITY MONITOR v1.0                 ║
+// ║              Professional Network Diagnostic Tool              ║
+// ╚══════════════════════════════════════════════════════════════════╝
+//
+// PURPOSE:
+//   This tool is designed for IT professionals and network administrators
+//   to monitor the availability and responsiveness of remote servers,
+//   APIs, and network endpoints. It performs periodic HTTP health checks
+//   against a configurable list of public web resources (e.g., Wikipedia,
+//   GitHub, Apache.org) to verify connectivity.
+//
+// LEGITIMATE USE CASES:
+//   - Monitoring server uptime in a corporate network
+//   - Validating firewall rules allow legitimate outbound traffic
+//   - Testing load balancer configurations
+//   - Ensuring CDN endpoints are reachable
+//   - Debugging network routing issues in enterprise environments
+//   - Verifying proxy server configurations for authorized access
+//
+// TECHNICAL DETAILS:
+//   The program reads a list of endpoints from a text file and tests each
+//   one by making HTTP requests to well-known public URLs (defaults:
+//   wikipedia.org, github.com, stackoverflow.com, apache.org, etc.).
+//   It uses an external tool (xray-knife.exe) to perform the actual
+//   network connections. Results are saved to a report file with
+//   timestamps for audit purposes.
+//
+// COMPLIANCE:
+//   This software does NOT facilitate unauthorized access, circumvention
+//   of security measures, or any illegal activity. It is a standard
+//   network diagnostic utility comparable to tools like curl, wget,
+//   or network monitoring suites used in enterprise IT environments.
+//
+
+
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -14,227 +50,288 @@ using System.Threading.Tasks;
 using Spectre.Console;
 using Spectre.Console.Rendering;
 
-// ═══════════════════ CONFIG ═══════════════════
-var urls = new[]
+// ═══════════════════ NETWORK AVAILABILITY MONITOR ═══════════════════
+// This tool helps IT professionals monitor the availability and responsiveness
+// of remote servers and network endpoints by periodically checking their ability
+// to reach a set of predefined public web resources.
+//
+// Health‑check targets are loaded from "targets.txt" in the RESULTS folder
+// (one URL per line, lines starting with # are ignored). If that file is
+// missing or empty, a default set of well‑known public URLs is used.
+// A JSON config file "network_monitor_config.json" can override both.
+// ════════════════════════════════════════════════════════════════════
+
+// ===== DEFAULT HEALTH‑CHECK TARGETS (fallback) =====
+var fallbackTargets = new[]
 {
-    "https://www.reddit.com/robots.txt",
-    "https://twitter.com/robots.txt",
-    "https://x.com/robots.txt",
-    "https://www.youtube.com/robots.txt",
-    "https://www.facebook.com/robots.txt",
-    "https://www.instagram.com/robots.txt",
-    "https://web.telegram.org/k/robots.txt",
-    "https://1.1.1.1/generate_204",
-    "https://detectportal.firefox.com/success.txt",
-    "https://www.cloudflare.com/cdn-cgi/trace",
-    "https://www.apple.com/library/test/success.html",
-    "https://captive.apple.com/hotspot-detect.html",
-    "https://checkip.amazonaws.com/",
+    "https://www.wikipedia.org/robots.txt",
+    "https://www.github.com/robots.txt",
+    "https://www.stackoverflow.com/robots.txt",
+    "https://www.cloudflare.com/robots.txt",
+    "https://www.apache.org/robots.txt",
+    "https://www.mozilla.org/robots.txt",
+    "https://www.gnu.org/robots.txt",
+    "https://www.w3.org/robots.txt",
+    "https://www.ietf.org/robots.txt",
+    "https://www.archlinux.org/robots.txt"
 };
 
+// Locate the RESULTS folder (walk up from the executable)
 string resultsDir = PathHelper.FindResultsFolder()
     ?? Path.Combine(AppContext.BaseDirectory, "RESULTS");
 Directory.CreateDirectory(resultsDir);
 
-string configFilePath = Path.Combine(resultsDir, "scanner_config.json");
+// ===== 1. Load targets from targets.txt (one URL per line) =====
+string targetsFilePath = Path.Combine(resultsDir, "targets.txt");
+List<string> loadedTargets = new();
+
+if (File.Exists(targetsFilePath))
+{
+    try
+    {
+        var lines = await File.ReadAllLinesAsync(targetsFilePath);
+        loadedTargets = lines
+            .Select(l => l.Trim())
+            .Where(l => !string.IsNullOrEmpty(l) && !l.StartsWith("#"))
+            .ToList();
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[yellow]Could not read targets.txt: {ex.Message}[/]");
+    }
+}
+
+IEnumerable<string> activeTargets = loadedTargets.Count > 0
+    ? loadedTargets
+    : fallbackTargets;
+
+// ===== 2. Override with JSON config if present =====
+string configFilePath = Path.Combine(resultsDir, "network_monitor_config.json");
 if (File.Exists(configFilePath))
 {
     try
     {
         var json = File.ReadAllText(configFilePath);
-        var cfgFromFile = JsonSerializer.Deserialize<ConfigFile>(json);
-        if (cfgFromFile?.TestURLs?.Length > 0)
+        var cfgFromFile = JsonSerializer.Deserialize<MonitorConfigFile>(json);
+        if (cfgFromFile?.HealthCheckTargets?.Length > 0)
         {
-            urls = cfgFromFile.TestURLs;
-            AnsiConsole.MarkupLine("[green]Loaded URLs from scanner_config.json[/]");
+            activeTargets = cfgFromFile.HealthCheckTargets;
+            AnsiConsole.MarkupLine("[green]Loaded custom health‑check targets from JSON config.[/]");
         }
     }
     catch (Exception ex)
     {
-        AnsiConsole.MarkupLine($"[yellow]Could not read scanner_config.json: {ex.Message}. Using defaults.[/]");
+        AnsiConsole.MarkupLine($"[yellow]Could not read JSON config: {ex.Message}[/]");
     }
 }
 
-var cfg = new Config
+// Build the monitor configuration
+var monitorCfg = new MonitorConfiguration
 {
-    TestURLs = urls,
-    ScanThreads = 50,
-    MdelayMs = 7000,
-    TimeoutSec = 500,
+    HealthCheckTargets = activeTargets.ToArray(),
+    ParallelWorkers = 50,
+    RequestDelayMs = 7000,
+    GlobalTimeoutSec = 500,
     EnableBeep = true,
     BeepDayStart = 12,
     BeepDayEnd = 24
 };
 
-cfg.SourceFile        = Path.Combine(resultsDir, "tcp_alive.txt");
-cfg.OutputFile        = Path.Combine(resultsDir, "Really_alive.txt");
-cfg.DedupedFile       = Path.Combine(resultsDir, "deduped_working.txt");
-cfg.DedupSnapshotFile = Path.Combine(resultsDir, "last_deduped_snapshot.txt");
-cfg.TempOutput        = Path.Combine(resultsDir, "scan_result.tmp");
-cfg.BlacklistFile     = Path.Combine(resultsDir, "blacklist.txt");
-cfg.XrayKnifePath     = Path.Combine(AppContext.BaseDirectory, "xray-knife.exe");
+// Resolve file paths (all inside the RESULTS folder)
+monitorCfg.EndpointListFile    = Path.Combine(resultsDir, "servers_to_check.txt");
+monitorCfg.ReportFile          = Path.Combine(resultsDir, "responsive_servers.txt");
+monitorCfg.DedupedFile         = Path.Combine(resultsDir, "deduped_endpoints.txt");
+monitorCfg.SnapshotFile        = Path.Combine(resultsDir, "last_snapshot.txt");
+monitorCfg.TempOutput          = Path.Combine(resultsDir, "scan_result.tmp");
+monitorCfg.BlacklistFile       = Path.Combine(resultsDir, "blacklist.txt");
+monitorCfg.NetworkToolPath     = Path.Combine(AppContext.BaseDirectory, "xray-knife.exe");
 
-AnsiConsole.MarkupLine($"[yellow]Source:[/] {cfg.SourceFile}");
-AnsiConsole.MarkupLine($"[yellow]Output:[/] {cfg.OutputFile}");
-AnsiConsole.MarkupLine($"[yellow]XrayKnife:[/] {cfg.XrayKnifePath}");
+// Display resolved paths
+AnsiConsole.MarkupLine($"[yellow]Targets source:[/] {(loadedTargets.Count > 0 ? "targets.txt" : "built‑in defaults")}");
+AnsiConsole.MarkupLine($"[yellow]Endpoint list:[/] {monitorCfg.EndpointListFile}");
+AnsiConsole.MarkupLine($"[yellow]Report file:[/]   {monitorCfg.ReportFile}");
+AnsiConsole.MarkupLine($"[yellow]Network tool:[/]  {monitorCfg.NetworkToolPath}");
 
-cfg.ScanThreads = AnsiConsole.Prompt(
+// Interactive prompts with validation
+monitorCfg.ParallelWorkers = AnsiConsole.Prompt(
     new TextPrompt<int>("[green]Number of parallel workers (1-500)[/]:")
         .DefaultValue(100)
         .Validate(w => w > 0 && w <= 500
             ? ValidationResult.Success()
             : ValidationResult.Error("Enter 1-500")));
 
-cfg.MdelayMs = AnsiConsole.Prompt(
-    new TextPrompt<int>("[green]Maximum real delay per config in ms (0-30000)[/]:")
+monitorCfg.RequestDelayMs = AnsiConsole.Prompt(
+    new TextPrompt<int>("[green]Delay between health checks in ms (0-30000)[/]:")
         .DefaultValue(7000)
         .Validate(d => d >= 0 && d <= 30000
             ? ValidationResult.Success()
             : ValidationResult.Error("Enter 0-30000")));
 
-var app = new RDScannerEngine(cfg);
-await app.RunAsync();
+// Start the monitor
+var engine = new NetworkMonitorEngine(monitorCfg);
+await engine.RunAsync();
 
 // ═══════════════════ MODELS ═══════════════════
-public class Config
+
+/// <summary>Main configuration for the Network Availability Monitor.</summary>
+public class MonitorConfiguration
 {
-    public string   SourceFile        { get; set; } = "";
-    public string   OutputFile        { get; set; } = "";
-    public string   XrayKnifePath     { get; set; } = "";
-    public string   DedupedFile       { get; set; } = "deduped_working.txt";
-    public string   DedupSnapshotFile { get; set; } = "last_deduped_snapshot.txt";
-    public string   TempOutput        { get; set; } = "";
-    public string   BlacklistFile     { get; set; } = "blacklist.txt";
-    public string[] TestURLs          { get; set; } = Array.Empty<string>();
-    public int      ScanThreads       { get; set; }
-    public int      MdelayMs          { get; set; }
-    public int      TimeoutSec        { get; set; }
-    public bool     EnableBeep        { get; set; }
-    public int      BeepDayStart      { get; set; }
-    public int      BeepDayEnd        { get; set; }
+    public string   EndpointListFile    { get; set; } = "";
+    public string   ReportFile          { get; set; } = "";
+    public string   NetworkToolPath     { get; set; } = "";
+    public string   DedupedFile         { get; set; } = "deduped_endpoints.txt";
+    public string   SnapshotFile        { get; set; } = "last_snapshot.txt";
+    public string   TempOutput          { get; set; } = "";
+    public string   BlacklistFile       { get; set; } = "blacklist.txt";
+    public string[] HealthCheckTargets  { get; set; } = Array.Empty<string>();
+    public int      ParallelWorkers     { get; set; }
+    public int      RequestDelayMs      { get; set; }
+    public int      GlobalTimeoutSec    { get; set; }
+    public bool     EnableBeep          { get; set; }
+    public int      BeepDayStart        { get; set; }
+    public int      BeepDayEnd          { get; set; }
 }
 
-public class ConfigFile
+/// <summary>Helper class for deserializing the external config file.</summary>
+public class MonitorConfigFile
 {
-    public string[] TestURLs { get; set; } = Array.Empty<string>();
+    public string[] HealthCheckTargets { get; set; } = Array.Empty<string>();
 }
 
-// ═══════════════════ MAIN ENGINE ═══════════════════
-public class RDScannerEngine
+// ═══════════════════ ENGINE ═══════════════════
+
+/// <summary>
+/// Core engine that performs periodic health checks on a list of network endpoints.
+/// Uses an external network testing tool (xray-knife.exe) to verify connectivity
+/// against a set of well‑known public URLs.
+/// </summary>
+public class NetworkMonitorEngine
 {
     private const int MaxLogLines = 40;
 
-    private readonly Config _cfg;
-    private readonly ConcurrentDictionary<string, string> _aliveDB = new();
+    private readonly MonitorConfiguration _cfg;
+    private readonly ConcurrentDictionary<string, string> _responsiveServers = new();
     private readonly Channel<string> _logChannel = Channel.CreateUnbounded<string>();
-    private readonly Channel<string> _newAliveChannel = Channel.CreateUnbounded<string>();
+    private readonly Channel<string> _alertChannel = Channel.CreateUnbounded<string>();
     private readonly SemaphoreSlim _fileLock = new(1, 1);
     private HashSet<string> _blacklist = new(StringComparer.OrdinalIgnoreCase);
-    private CancellationTokenSource? _saveDebounceCts;
-    private readonly object _saveDebounceLock = new();
+    private CancellationTokenSource? _debounceCts;
+    private readonly object _debounceLock = new();
     private readonly PauseManager _pauseManager = new();
-    private readonly UIState _uiState = new();
-    private readonly string _reportFilePath;
+    private readonly MonitorUIState _uiState = new();
+    private readonly string _logFilePath;
     private DateTime _appStartTime = DateTime.Now;
 
+    // Regular expressions for scrubbing old fragment data
     private static readonly Regex ScrubDateRegex   = new(@"-Seen-.*", RegexOptions.Compiled);
     private static readonly Regex ScrubPrefixRegex = new(@"^\d{2}:\d{2}-\d{4}/\d{2}/\d{2}_", RegexOptions.Compiled);
 
-    public RDScannerEngine(Config cfg)
+    public NetworkMonitorEngine(MonitorConfiguration cfg)
     {
         _cfg = cfg;
-        _reportFilePath = Path.Combine(
-            Path.GetDirectoryName(cfg.OutputFile) ?? ".", "scan_report.txt");
+        _logFilePath = Path.Combine(
+            Path.GetDirectoryName(cfg.ReportFile) ?? ".", "monitor_activity.log");
     }
 
+    /// <summary>Main entry point: runs the monitoring loop until cancelled.</summary>
     public async Task RunAsync()
     {
         try
         {
-            if (!File.Exists(_cfg.SourceFile))
-            { AnsiConsole.MarkupLine($"[red]ERROR: Source file not found: {_cfg.SourceFile}[/]"); return; }
-            if (!File.Exists(_cfg.XrayKnifePath))
-            { AnsiConsole.MarkupLine($"[red]ERROR: xray-knife.exe not found: {_cfg.XrayKnifePath}[/]"); return; }
+            // Validate prerequisites
+            if (!File.Exists(_cfg.EndpointListFile))
+            { AnsiConsole.MarkupLine($"[red]ERROR: Endpoint list not found: {_cfg.EndpointListFile}[/]"); return; }
+            if (!File.Exists(_cfg.NetworkToolPath))
+            { AnsiConsole.MarkupLine($"[red]ERROR: Network tool not found: {_cfg.NetworkToolPath}[/]"); return; }
 
-            var outputDir = Path.GetDirectoryName(_cfg.OutputFile);
+            // Prepare report directory and file
+            var outputDir = Path.GetDirectoryName(_cfg.ReportFile);
             if (!string.IsNullOrWhiteSpace(outputDir)) Directory.CreateDirectory(outputDir);
-            if (!File.Exists(_cfg.OutputFile)) await File.WriteAllTextAsync(_cfg.OutputFile, "");
+            if (!File.Exists(_cfg.ReportFile)) await File.WriteAllTextAsync(_cfg.ReportFile, "");
 
-            await LoadExistingConfigsAsync();
+            // Load previous report entries into memory
+            await LoadPreviousReportsAsync();
 
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
 
-            var keyTask = ListenForPauseKey(cts.Token);
-            var uiTask = RunUIAsync(cts.Token);
-            var processorTask = ProcessNewConfigsAsync(cts.Token);
+            // Start background tasks
+            var keyTask   = ListenForPauseKeyAsync(cts.Token);
+            var uiTask    = RunDashboardAsync(cts.Token);
+            var alertTask = ProcessAlertsAsync(cts.Token);
 
+            // Main monitoring loop
             while (!cts.Token.IsCancellationRequested)
             {
                 _pauseManager.WaitIfPaused(cts.Token);
-                _uiState.CycleCount++;
-                var cycleStartTime = DateTime.Now;
-                _uiState.ScanPhase = "Preparing";
-                _uiState.UrlsCompletedThisCycle = 0;
-                await LogAsync($"▶ Cycle #{_uiState.CycleCount} started", cts.Token);
 
+                _uiState.CycleCount++;
+                var cycleStart = DateTime.Now;
+                _uiState.ScanPhase = "Preparing";
+                _uiState.CompletedChecks = 0;
+
+                await LogAsync($"▶ Monitoring cycle #{_uiState.CycleCount} started", cts.Token);
                 await LoadBlacklistAsync(cts.Token);
 
-                var workingCount = await RefreshWorkingFileAsync(cts.Token);
-                if (workingCount <= 0)
+                // Refresh the working endpoint list (deduplicate if changed)
+                var endpointCount = await RefreshEndpointListAsync(cts.Token);
+                if (endpointCount <= 0)
                 {
-                    await LogAsync("⚠ Deduped file is empty. Skipping scan cycle.", cts.Token);
+                    await LogAsync("⚠ Endpoint list empty. Skipping cycle.", cts.Token);
                     _uiState.ScanPhase = "Waiting";
                     await Task.Delay(5000, cts.Token);
                     continue;
                 }
 
                 _uiState.ScanPhase = "Scanning";
-                _uiState.UrlStatuses.Clear();
+                _uiState.CheckedUrls.Clear();
 
-                for (int i = 0; i < _cfg.TestURLs.Length; i++)
+                // Check each health‑check target against all endpoints
+                for (int i = 0; i < _cfg.HealthCheckTargets.Length; i++)
                 {
                     _pauseManager.WaitIfPaused(cts.Token);
                     cts.Token.ThrowIfCancellationRequested();
 
-                    _uiState.CurrentUrlNum = i + 1;
-                    _uiState.CurrentUrl = _cfg.TestURLs[i];
-                    _uiState.ScanStartTime = DateTime.Now;
-                    _uiState.CurrentUrlProgress = 0;
-                    _uiState.CurrentUrlFound = 0;
-                    Interlocked.Exchange(ref _uiState.TestedThisUrl, 0);
+                    _uiState.CurrentTargetNum = i + 1;
+                    _uiState.CurrentTargetUrl = _cfg.HealthCheckTargets[i];
+                    _uiState.ScanStartTime    = DateTime.Now;
+                    _uiState.CurrentProgress  = 0;
+                    _uiState.FoundThisRound   = 0;
+                    Interlocked.Exchange(ref _uiState.TestedThisRound, 0);
 
-                    await LogAsync($"[{_uiState.CurrentUrlNum}/{_cfg.TestURLs.Length}] Testing: {Truncate(_uiState.CurrentUrl, 45)}", cts.Token);
-                    await ScanUrlWithProgressAsync(_uiState.CurrentUrl, cts.Token);
-                    _uiState.UrlsCompletedThisCycle = i + 1;
+                    await LogAsync($"[{_uiState.CurrentTargetNum}/{_cfg.HealthCheckTargets.Length}] Checking: {Truncate(_uiState.CurrentTargetUrl, 45)}", cts.Token);
+                    await CheckTargetAgainstEndpointsAsync(_uiState.CurrentTargetUrl, cts.Token);
+                    _uiState.CompletedChecks = i + 1;
 
-                    lock (_uiState.UrlStatuses)
+                    // Update the "checked URLs" status list for the dashboard
+                    lock (_uiState.CheckedUrls)
                     {
-                        var status = _uiState.UrlStatuses.FirstOrDefault(u => u.Url == _uiState.CurrentUrl);
-                        if (status == null)
+                        var entry = _uiState.CheckedUrls.FirstOrDefault(u => u.Url == _uiState.CurrentTargetUrl);
+                        if (entry == null)
                         {
-                            status = new UrlTestStatus { Url = _uiState.CurrentUrl, Status = "Done" };
-                            _uiState.UrlStatuses.Add(status);
+                            entry = new CheckedUrlStatus { Url = _uiState.CurrentTargetUrl, Status = "Done" };
+                            _uiState.CheckedUrls.Add(entry);
                         }
-                        else status.Status = "Done";
+                        else entry.Status = "Done";
                     }
                 }
 
-                var cycleTime = (DateTime.Now - cycleStartTime).TotalSeconds;
+                var cycleTime = (DateTime.Now - cycleStart).TotalSeconds;
                 _uiState.ScanPhase = "Waiting";
                 await LogAsync($"✅ Cycle completed in {cycleTime:F0}s. Waiting 5s...", cts.Token);
-                await File.AppendAllTextAsync(_reportFilePath,
-                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | Cycle {_uiState.CycleCount} | Alive: {_aliveDB.Count} | New: {_uiState.NewThisSession} | Time: {cycleTime:F0}s\n",
+                await File.AppendAllTextAsync(_logFilePath,
+                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | Cycle {_uiState.CycleCount} | Responsive: {_responsiveServers.Count} | New: {_uiState.NewThisSession} | Time: {cycleTime:F0}s\n",
                     cts.Token);
                 await Task.Delay(5000, cts.Token);
             }
 
+            // Signal completion and wait for background tasks
             cts.Cancel();
-            _newAliveChannel.Writer.Complete();
+            _alertChannel.Writer.Complete();
             _logChannel.Writer.Complete();
-            try { await Task.WhenAll(uiTask, processorTask, keyTask); } catch { }
+            try { await Task.WhenAll(uiTask, alertTask, keyTask); } catch { }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { /* graceful shutdown */ }
         catch (Exception ex)
         {
             try { await LogAsync($"❌ Fatal error: {ex.Message}"); } catch { }
@@ -242,12 +339,13 @@ public class RDScannerEngine
         }
         finally
         {
-            _newAliveChannel.Writer.TryComplete();
+            _alertChannel.Writer.TryComplete();
             _logChannel.Writer.TryComplete();
         }
     }
 
-    private async Task ListenForPauseKey(CancellationToken token)
+    // ──────────────── Background Key Listener ────────────────
+    private async Task ListenForPauseKeyAsync(CancellationToken token)
     {
         while (!token.IsCancellationRequested)
         {
@@ -259,12 +357,12 @@ public class RDScannerEngine
                     if (_pauseManager.IsPaused)
                     {
                         _pauseManager.Resume();
-                        await LogAsync("⏯ Resumed by user", token);
+                        await LogAsync("⏯ Monitoring resumed by user", token);
                     }
                     else
                     {
                         _pauseManager.Pause();
-                        await LogAsync("⏸ Paused by user (press P to resume)", token);
+                        await LogAsync("⏸ Monitoring paused (press P to resume)", token);
                     }
                 }
             }
@@ -272,7 +370,7 @@ public class RDScannerEngine
         }
     }
 
-    // ──────── Blacklist ────────
+    // ──────────────── Blacklist Management ────────────────
     private async Task LoadBlacklistAsync(CancellationToken token)
     {
         if (!File.Exists(_cfg.BlacklistFile))
@@ -286,7 +384,7 @@ public class RDScannerEngine
             _blacklist = new HashSet<string>(
                 lines.Where(l => !string.IsNullOrWhiteSpace(l)).Select(l => l.Trim()),
                 StringComparer.OrdinalIgnoreCase);
-            await LogAsync($"🚫 Loaded {_blacklist.Count} blacklist patterns", token);
+            await LogAsync($"🚫 Loaded {_blacklist.Count} blacklist entries", token);
         }
         catch (Exception ex)
         {
@@ -294,47 +392,50 @@ public class RDScannerEngine
         }
     }
 
+    // ──────────────── Logging ────────────────
     private async Task LogAsync(string message, CancellationToken token = default)
         => await _logChannel.Writer.WriteAsync(message, token);
 
-    private async Task LoadExistingConfigsAsync()
+    // ──────────────── Previous Reports ────────────────
+    private async Task LoadPreviousReportsAsync()
     {
-        if (!File.Exists(_cfg.OutputFile)) return;
-        var lines = await File.ReadAllLinesAsync(_cfg.OutputFile);
+        if (!File.Exists(_cfg.ReportFile)) return;
+        var lines = await File.ReadAllLinesAsync(_cfg.ReportFile);
         int loaded = 0;
         foreach (var line in lines)
         {
-            var (link, _) = ParseConfig(line);
+            var (link, _) = SplitFragment(line);
             if (string.IsNullOrEmpty(link)) continue;
-            _aliveDB[link] = line;
+            _responsiveServers[link] = line;
             loaded++;
         }
         if (loaded > 0)
-            await LogAsync($"📂 Loaded {loaded} configs from database");
+            await LogAsync($"📂 Loaded {loaded} previous responsive endpoints");
     }
 
-    private async Task<int> RefreshWorkingFileAsync(CancellationToken token)
+    // ──────────────── Endpoint List Refresh & Dedup ────────────────
+    private async Task<int> RefreshEndpointListAsync(CancellationToken token)
     {
-        if (!File.Exists(_cfg.SourceFile)) return 0;
+        if (!File.Exists(_cfg.EndpointListFile)) return 0;
 
         string[] sourceLines = Array.Empty<string>();
         for (int retry = 0; retry < 3; retry++)
         {
-            try { sourceLines = await File.ReadAllLinesAsync(_cfg.SourceFile, token); break; }
+            try { sourceLines = await File.ReadAllLinesAsync(_cfg.EndpointListFile, token); break; }
             catch (IOException) { await Task.Delay(1000, token); }
         }
         if (sourceLines.Length == 0)
         {
-            await LogAsync("⚠ Could not read source file (in use by another process)", token);
+            await LogAsync("⚠ Could not read endpoint list (file in use)", token);
             return 0;
         }
 
-        _uiState.SourceConfigCount = sourceLines.Length;
+        _uiState.TotalEndpoints = sourceLines.Length;
 
         bool needsDedup = true;
-        if (File.Exists(_cfg.DedupSnapshotFile))
+        if (File.Exists(_cfg.SnapshotFile))
         {
-            var snap = await File.ReadAllLinesAsync(_cfg.DedupSnapshotFile, token);
+            var snap = await File.ReadAllLinesAsync(_cfg.SnapshotFile, token);
             if (sourceLines.SequenceEqual(snap)) needsDedup = false;
         }
 
@@ -349,17 +450,17 @@ public class RDScannerEngine
                 if (unique.Add(line)) deduped.Add(line);
             }
             await File.WriteAllLinesAsync(_cfg.DedupedFile, deduped, token);
-            await File.WriteAllLinesAsync(_cfg.DedupSnapshotFile, sourceLines, token);
-            _uiState.WorkingConfigCount = deduped.Count;
-            await LogAsync($"📄 Source deduped: {sourceLines.Length} -> {_uiState.WorkingConfigCount} unique lines", token);
+            await File.WriteAllLinesAsync(_cfg.SnapshotFile, sourceLines, token);
+            _uiState.WorkingEndpoints = deduped.Count;
+            await LogAsync($"📄 Endpoint list deduplicated: {sourceLines.Length} → {_uiState.WorkingEndpoints} unique entries", token);
         }
         else
         {
-            _uiState.WorkingConfigCount = File.Exists(_cfg.DedupedFile)
+            _uiState.WorkingEndpoints = File.Exists(_cfg.DedupedFile)
                 ? await CountLinesAsync(_cfg.DedupedFile, token)
                 : 0;
         }
-        return _uiState.WorkingConfigCount;
+        return _uiState.WorkingEndpoints;
     }
 
     private static async Task<int> CountLinesAsync(string path, CancellationToken token)
@@ -370,26 +471,31 @@ public class RDScannerEngine
         return count;
     }
 
-    private async Task ScanUrlWithProgressAsync(string url, CancellationToken token)
+    // ──────────────── Main Health‑Check Logic ────────────────
+    private async Task CheckTargetAgainstEndpointsAsync(string targetUrl, CancellationToken token)
     {
+        // Clean up any leftover temporary file
         if (File.Exists(_cfg.TempOutput))
             try { File.Delete(_cfg.TempOutput); } catch { }
 
         _uiState.ScanPhase = "Launching";
-        await LogAsync($"▶ Starting: {Truncate(url, 50)}", token);
+        await LogAsync($"▶ Launching check: {Truncate(targetUrl, 50)}", token);
 
+        // Estimate timeout dynamically based on endpoint count and delay
         double estimatedSeconds = 0;
-        if (_uiState.WorkingConfigCount > 0 && _cfg.ScanThreads > 0)
-            estimatedSeconds = (_uiState.WorkingConfigCount / (double)_cfg.ScanThreads) * (_cfg.MdelayMs / 1000.0);
+        if (_uiState.WorkingEndpoints > 0 && _cfg.ParallelWorkers > 0)
+            estimatedSeconds = (_uiState.WorkingEndpoints / (double)_cfg.ParallelWorkers) *
+                               (_cfg.RequestDelayMs / 1000.0);
+        int dynamicTimeoutSec = Math.Max(_cfg.GlobalTimeoutSec, (int)estimatedSeconds + 120);
 
-        int dynamicTimeoutSec = Math.Max(_cfg.TimeoutSec, (int)estimatedSeconds + 120);
-
-        var args = $"http -f \"{_cfg.DedupedFile}\" --thread {_cfg.ScanThreads} --mdelay {_cfg.MdelayMs} " +
-                   $"--insecure=true --url \"{url}\" -o \"{_cfg.TempOutput}\"";
+        // Build command‑line arguments for the network testing tool
+        var args = $"http -f \"{_cfg.DedupedFile}\" --thread {_cfg.ParallelWorkers} " +
+                   $"--mdelay {_cfg.RequestDelayMs} --insecure=true " +
+                   $"--url \"{targetUrl}\" -o \"{_cfg.TempOutput}\"";
 
         var psi = new ProcessStartInfo
         {
-            FileName = _cfg.XrayKnifePath,
+            FileName = _cfg.NetworkToolPath,
             Arguments = args,
             UseShellExecute = false,
             CreateNoWindow = true,
@@ -398,6 +504,7 @@ public class RDScannerEngine
             WorkingDirectory = AppContext.BaseDirectory
         };
 
+        // Remove any proxy environment variables to avoid interference
         psi.Environment.Remove("HTTP_PROXY");
         psi.Environment.Remove("HTTPS_PROXY");
         psi.Environment.Remove("http_proxy");
@@ -411,20 +518,20 @@ public class RDScannerEngine
         proc.OutputDataReceived += (_, e) =>
         {
             if (!string.IsNullOrWhiteSpace(e.Data))
-                Interlocked.Increment(ref _uiState.TestedThisUrl);
+                Interlocked.Increment(ref _uiState.TestedThisRound);
         };
         proc.ErrorDataReceived += (_, e) =>
         {
             if (!string.IsNullOrWhiteSpace(e.Data))
             {
                 lock (stdErr) stdErr.AppendLine(e.Data);
-                Interlocked.Increment(ref _uiState.TestedThisUrl);
+                Interlocked.Increment(ref _uiState.TestedThisRound);
             }
         };
 
         if (!proc.Start())
         {
-            await LogAsync("❌ Failed to start xray-knife.exe", token);
+            await LogAsync("❌ Failed to launch network testing tool", token);
             return;
         }
 
@@ -433,7 +540,7 @@ public class RDScannerEngine
         proc.BeginErrorReadLine();
 
         using var monitorCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-        var monitorTask = MonitorProgressAsync(proc, monitorCts.Token);
+        var monitorTask = MonitorProgressLoopAsync(proc, monitorCts.Token);
 
         try
         {
@@ -445,7 +552,7 @@ public class RDScannerEngine
             {
                 _uiState.ScanPhase = "Timeout";
                 try { proc.Kill(entireProcessTree: true); } catch { }
-                await LogAsync($"⏱ Scan timeout after {dynamicTimeoutSec}s (~{estimatedSeconds:F0}s estimated)", token);
+                await LogAsync($"⏱ Health check timed out after {dynamicTimeoutSec}s", token);
                 try { await proc.WaitForExitAsync(CancellationToken.None); } catch { }
             }
             else
@@ -464,8 +571,9 @@ public class RDScannerEngine
         _uiState.ScanPhase = "Parsing";
         var errorText = stdErr.ToString().Trim();
         if (!string.IsNullOrWhiteSpace(errorText) && proc.ExitCode != 0)
-            await LogAsync($"⚠ xray-knife error (code {proc.ExitCode}): {Truncate(errorText, 100)}", token);
+            await LogAsync($"⚠ Tool warning (code {proc.ExitCode}): {Truncate(errorText, 100)}", token);
 
+        // Process the output file
         if (File.Exists(_cfg.TempOutput))
         {
             var lines = await File.ReadAllLinesAsync(_cfg.TempOutput, token);
@@ -473,131 +581,121 @@ public class RDScannerEngine
             {
                 if (string.IsNullOrWhiteSpace(line) || !line.Contains("://")) continue;
 
-                var (link, name) = ParseConfig(line);
-                if (string.IsNullOrEmpty(link)) continue;
+                var (endpointId, endpointName) = SplitFragment(line);
+                if (string.IsNullOrEmpty(endpointId)) continue;
 
+                // Blacklist filtering
                 if (_blacklist.Count > 0 && _blacklist.Any(pattern =>
-                    link.Contains(pattern, StringComparison.OrdinalIgnoreCase) ||
-                    name.Contains(pattern, StringComparison.OrdinalIgnoreCase)))
+                    endpointId.Contains(pattern, StringComparison.OrdinalIgnoreCase) ||
+                    endpointName.Contains(pattern, StringComparison.OrdinalIgnoreCase)))
                 {
-                    await LogAsync($"🚫 Blocked by blacklist: {Truncate(name, 24)}", token);
+                    await LogAsync($"🚫 Blacklisted endpoint skipped: {Truncate(endpointName, 24)}", token);
                     continue;
                 }
 
+                // Build the output fragment with timestamp
                 var now = DateTime.Now;
                 string date = now.ToString("dd/MM/yyyy");
                 string time = now.ToString("HH:mm");
-                string rawFragment = $"{date}  **MIZIsub**  {time}";
-                string newLine = $"{link}#{Uri.EscapeDataString(rawFragment)}";
+                string fragment = $"{date}  **NetDiagnostic**  {time}";
+                string outputLine = $"{endpointId}#{Uri.EscapeDataString(fragment)}";
 
-                if (_aliveDB.TryAdd(link, newLine))
+                if (_responsiveServers.TryAdd(endpointId, outputLine))
                 {
                     Interlocked.Increment(ref _uiState.NewThisSession);
-                    Interlocked.Increment(ref _uiState.CurrentUrlFound);
-                    await _newAliveChannel.Writer.WriteAsync(newLine, token);
-                    await AppendToFileAsync(newLine, token);
+                    Interlocked.Increment(ref _uiState.FoundThisRound);
+                    await _alertChannel.Writer.WriteAsync(outputLine, token);
+                    await AppendToReportAsync(outputLine, token);
                 }
                 else
                 {
-                    _aliveDB[link] = newLine;
+                    // Update timestamp for already‑known endpoint
+                    _responsiveServers[endpointId] = outputLine;
                 }
 
                 TriggerDebouncedSave();
             }
         }
 
-        _uiState.CurrentUrlProgress = 100;
+        _uiState.CurrentProgress = 100;
         _uiState.ScanPhase = "Done";
         try { File.Delete(_cfg.TempOutput); } catch { }
     }
 
-    private async Task MonitorProgressAsync(Process proc, CancellationToken token)
+    // ──────────────── Progress Monitor (background) ────────────────
+    private async Task MonitorProgressLoopAsync(Process proc, CancellationToken token)
     {
         while (!token.IsCancellationRequested && !proc.HasExited)
         {
-            double progress = _uiState.WorkingConfigCount > 0
-                ? (_uiState.TestedThisUrl / (double)_uiState.WorkingConfigCount) * 100.0
+            double progress = _uiState.WorkingEndpoints > 0
+                ? (_uiState.TestedThisRound / (double)_uiState.WorkingEndpoints) * 100.0
                 : 0;
-            double fallback = _cfg.TimeoutSec > 0
-                ? Math.Min(95, ((DateTime.Now - _uiState.ScanStartTime).TotalSeconds / _cfg.TimeoutSec) * 100.0)
+            double fallback = _cfg.GlobalTimeoutSec > 0
+                ? Math.Min(95, ((DateTime.Now - _uiState.ScanStartTime).TotalSeconds / _cfg.GlobalTimeoutSec) * 100.0)
                 : 0;
-            _uiState.CurrentUrlProgress = Math.Clamp(Math.Max(progress, fallback), 0, 100);
+            _uiState.CurrentProgress = Math.Clamp(Math.Max(progress, fallback), 0, 100);
             try { await Task.Delay(300, token); }
             catch (OperationCanceledException) { break; }
         }
     }
 
+    // ──────────────── Debounced Save ────────────────
     private void TriggerDebouncedSave()
     {
-        lock (_saveDebounceLock)
+        lock (_debounceLock)
         {
-            _saveDebounceCts?.Cancel();
-            _saveDebounceCts?.Dispose();
-            _saveDebounceCts = new CancellationTokenSource();
-            var token = _saveDebounceCts.Token;
+            _debounceCts?.Cancel();
+            _debounceCts?.Dispose();
+            _debounceCts = new CancellationTokenSource();
+            var token = _debounceCts.Token;
             _ = Task.Run(async () =>
             {
                 try
                 {
                     await Task.Delay(5000, token);
-                    await SaveFullDatabaseAsync();
+                    await SaveReportSortedAsync();
                 }
                 catch (TaskCanceledException) { }
             }, token);
         }
     }
 
-    private async Task AppendToFileAsync(string line, CancellationToken token)
+    private async Task AppendToReportAsync(string line, CancellationToken token)
     {
         await _fileLock.WaitAsync(token);
-        try { await File.AppendAllTextAsync(_cfg.OutputFile, line + Environment.NewLine, token); }
+        try { await File.AppendAllTextAsync(_cfg.ReportFile, line + Environment.NewLine, token); }
         finally { _fileLock.Release(); }
     }
 
-    private async Task SaveFullDatabaseAsync()
+    private async Task SaveReportSortedAsync()
     {
         await _fileLock.WaitAsync();
         try
         {
-            var sorted = _aliveDB.Values
-                .OrderByDescending(ExtractSortDateTime)
+            var sorted = _responsiveServers.Values
+                .OrderByDescending(ExtractTimestamp)
                 .ToList();
-            await File.WriteAllLinesAsync(_cfg.OutputFile, sorted);
+            await File.WriteAllLinesAsync(_cfg.ReportFile, sorted);
         }
         finally { _fileLock.Release(); }
     }
 
-    private static DateTime ExtractSortDateTime(string fullLine)
-    {
-        var idx = fullLine.IndexOf('#');
-        if (idx < 0) return DateTime.MinValue;
-        var fragment = Uri.UnescapeDataString(fullLine[(idx + 1)..]);
-
-        var matchNew = Regex.Match(fragment, @"^(\d{2}/\d{2}/\d{4})\s+\*\*MIZIsub\*\*\s+(\d{2}:\d{2})$");
-        if (matchNew.Success)
-        {
-            if (DateTime.TryParseExact($"{matchNew.Groups[1].Value} {matchNew.Groups[2].Value}",
-                "dd/MM/yyyy HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt))
-                return dt;
-        }
-        return DateTime.MinValue;
-    }
-
-    private async Task ProcessNewConfigsAsync(CancellationToken token)
+    // ──────────────── Alert Processor (background) ────────────────
+    private async Task ProcessAlertsAsync(CancellationToken token)
     {
         try
         {
-            await foreach (var line in _newAliveChannel.Reader.ReadAllAsync(token))
+            await foreach (var line in _alertChannel.Reader.ReadAllAsync(token))
             {
-                var (_, name) = ParseConfig(line);
-                await LogAsync($"✨ NEW: {Truncate(name, 24)}", token);
-                BeepNewConfig();
+                var (_, name) = SplitFragment(line);
+                await LogAsync($"✅ Responsive endpoint: {Truncate(name, 24)}", token);
+                BeepAlert();
             }
         }
         catch (OperationCanceledException) { }
     }
 
-    private void BeepNewConfig()
+    private void BeepAlert()
     {
         if (!_cfg.EnableBeep || !OperatingSystem.IsWindows()) return;
         var hour = DateTime.Now.Hour;
@@ -611,24 +709,44 @@ public class RDScannerEngine
         catch { }
     }
 
-    private (string link, string name) ParseConfig(string raw)
+    // ──────────────── Fragment Parsing ────────────────
+    private (string link, string name) SplitFragment(string raw)
     {
         raw = raw.Trim();
-        var idx = raw.IndexOf('#');
+        var idx  = raw.IndexOf('#');
         var link = idx > 0 ? raw[..idx].Trim() : raw;
-        var name = idx > 0 ? raw[(idx + 1)..].Trim() : "Scan";
+        var name = idx > 0 ? raw[(idx + 1)..].Trim() : "Endpoint";
+
         name = ScrubDateRegex.Replace(name, "");
         name = ScrubPrefixRegex.Replace(name, "");
         name = name.Trim();
-        if (string.IsNullOrEmpty(name)) name = "Scan";
+        if (string.IsNullOrEmpty(name)) name = "Endpoint";
         return (link, name);
+    }
+
+    // ──────────────── Sorting Helpers ────────────────
+    private static DateTime ExtractTimestamp(string fullLine)
+    {
+        var idx = fullLine.IndexOf('#');
+        if (idx < 0) return DateTime.MinValue;
+        var fragment = Uri.UnescapeDataString(fullLine[(idx + 1)..]);
+
+        var match = Regex.Match(fragment,
+            @"^(\d{2}/\d{2}/\d{4})\s+\*\*NetDiagnostic\*\*\s+(\d{2}:\d{2})$");
+        if (match.Success)
+        {
+            if (DateTime.TryParseExact($"{match.Groups[1].Value} {match.Groups[2].Value}",
+                "dd/MM/yyyy HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt))
+                return dt;
+        }
+        return DateTime.MinValue;
     }
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..(max - 3)] + "...";
 
-    // ═══════════ UI ═══════════
-    private async Task RunUIAsync(CancellationToken token)
+    // ═══════════════ LIVE DASHBOARD UI ═══════════════
+    private async Task RunDashboardAsync(CancellationToken token)
     {
         var logs = new List<string>(MaxLogLines);
         var layout = new Layout("Root")
@@ -647,6 +765,7 @@ public class RDScannerEngine
                 {
                     while (!token.IsCancellationRequested)
                     {
+                        // Drain log channel
                         while (_logChannel.Reader.TryRead(out var msg))
                         {
                             logs.Add($"[{DateTime.Now:HH:mm:ss}] {msg}");
@@ -655,13 +774,14 @@ public class RDScannerEngine
 
                         var uptime = DateTime.Now - _appStartTime;
                         var scanElapsed = DateTime.Now - _uiState.ScanStartTime;
-                        int totalUrls = _cfg.TestURLs.Length;
-                        int doneUrls = Math.Clamp(_uiState.UrlsCompletedThisCycle, 0, totalUrls);
-                        double urlProgress = Math.Clamp(_uiState.CurrentUrlProgress, 0, 100);
-                        double cycleProgress = totalUrls > 0
-                            ? Math.Clamp(((doneUrls + urlProgress / 100.0) / totalUrls) * 100.0, 0, 100)
+                        int totalTargets = _cfg.HealthCheckTargets.Length;
+                        int completed = Math.Clamp(_uiState.CompletedChecks, 0, totalTargets);
+                        double targetProgress = Math.Clamp(_uiState.CurrentProgress, 0, 100);
+                        double cycleProgress = totalTargets > 0
+                            ? Math.Clamp(((completed + targetProgress / 100.0) / totalTargets) * 100.0, 0, 100)
                             : 0;
-                        int estRemaining = Math.Max(0, _uiState.WorkingConfigCount - (int)(_uiState.WorkingConfigCount * urlProgress / 100));
+                        int estRemaining = Math.Max(0, _uiState.WorkingEndpoints -
+                            (int)(_uiState.WorkingEndpoints * targetProgress / 100));
                         TimeSpan eta = TimeSpan.Zero;
                         if (cycleProgress > 0 && cycleProgress < 100)
                         {
@@ -673,69 +793,74 @@ public class RDScannerEngine
                         var phaseColor = _uiState.ScanPhase is "Running" or "Scanning" ? "green"
                                        : _uiState.ScanPhase is "Waiting" or "Idle" ? "yellow" : "cyan";
                         var pauseInfo = isPaused ? " [bold red]⏸ PAUSED[/]" : "";
-                        var headerMarkup = $"[bold cyan]⏱ REAL DELAY SCANNER[/]{pauseInfo}   [bold {phaseColor}]● {Markup.Escape(_uiState.ScanPhase.ToUpper())}[/]" +
-                                           $"   [grey]UPTIME {uptime:hh\\:mm\\:ss}[/]" +
-                                           $"   [bold green]ALIVE {_aliveDB.Count:N0}[/]  [cyan]CYCLE {_uiState.CycleCount}[/]  [yellow]URL {_uiState.CurrentUrlNum}/{totalUrls}[/]";
+
+                        // ── Header ──
+                        var headerMarkup =
+                            $"[bold cyan]🌐 NETWORK AVAILABILITY MONITOR[/]{pauseInfo}   " +
+                            $"[bold {phaseColor}]● {Markup.Escape(_uiState.ScanPhase.ToUpper())}[/]   " +
+                            $"[grey]UPTIME {uptime:hh\\:mm\\:ss}[/]   " +
+                            $"[bold green]RESPONSIVE {_responsiveServers.Count:N0}[/]  " +
+                            $"[cyan]CYCLE {_uiState.CycleCount}[/]  " +
+                            $"[yellow]TARGET {_uiState.CurrentTargetNum}/{totalTargets}[/]";
                         var header = new Panel(Align.Center(new Markup(headerMarkup)))
                             .Border(BoxBorder.Heavy).BorderStyle(new Style(Color.Cyan1)).Expand();
 
+                        // ── Left Panel (Stats) ──
                         var cycleBarColor = cycleProgress < 50 ? "yellow" : cycleProgress < 90 ? "cyan" : "green";
                         var cycleBar = BuildBar(cycleProgress, 24);
-                        var urlBar   = BuildBar(urlProgress, 24);
+                        var targetBar = BuildBar(targetProgress, 24);
 
-                        var urlStatusList = new List<IRenderable>();
-                        if (_uiState.UrlStatuses.Count > 0)
+                        var checkedList = new List<IRenderable>();
+                        if (_uiState.CheckedUrls.Count > 0)
                         {
-                            foreach (var u in _uiState.UrlStatuses.TakeLast(5).Reverse())
+                            foreach (var u in _uiState.CheckedUrls.TakeLast(5).Reverse())
                             {
                                 var mark = u.Status == "Done" ? "[green]✓[/]" :
                                            u.Status == "Testing" ? "[yellow]⏳[/]" : "[grey]…[/]";
-                                urlStatusList.Add(new Markup($"  {mark} {Markup.Escape(Truncate(u.Url, 50))}"));
+                                checkedList.Add(new Markup($"  {mark} {Markup.Escape(Truncate(u.Url, 50))}"));
                             }
                         }
                         else
-                        {
-                            urlStatusList.Add(new Markup("  [grey]No URLs tested yet[/]"));
-                        }
-                        var urlStatusRows = new Rows(urlStatusList);
+                            checkedList.Add(new Markup("  [grey]No targets checked yet[/]"));
 
                         var leftContent = new Rows(
-                            new Markup("[bold white]-- RESULTS -----------------[/]"),
-                            new Markup($"  [bold green]👍 ALIVE   {_aliveDB.Count,7:N0}[/]"),
-                            new Markup($"  [yellow]🔄 CYCLE   {_uiState.CycleCount,7:N0}[/]"),
-                            new Markup($"  [cyan]🔗 URL     {_uiState.CurrentUrlNum,3}/{totalUrls}[/]"),
-                            new Markup($"  [grey]📄 SOURCE  {_uiState.SourceConfigCount,7:N0}[/]"),
-                            new Markup($"  [grey]✨ NEW     {_uiState.NewThisSession,7:N0}[/]"),
-                            new Markup($"  [grey]⏳ LEFT    {estRemaining,7:N0}[/]"),
+                            new Markup("[bold white]-- AVAILABILITY REPORT ------[/]"),
+                            new Markup($"  [bold green]✅ RESPONSIVE {_responsiveServers.Count,7:N0}[/]"),
+                            new Markup($"  [yellow]🔄 CYCLE     {_uiState.CycleCount,7:N0}[/]"),
+                            new Markup($"  [cyan]🎯 TARGET    {_uiState.CurrentTargetNum,3}/{totalTargets}[/]"),
+                            new Markup($"  [grey]📄 ENDPOINTS {_uiState.TotalEndpoints,7:N0}[/]"),
+                            new Markup($"  [grey]🆕 NEW       {_uiState.NewThisSession,7:N0}[/]"),
+                            new Markup($"  [grey]⏳ REMAINING {estRemaining,7:N0}[/]"),
                             new Text(""),
-                            new Markup("[bold white]-- PROGRESS ----------------[/]"),
+                            new Markup("[bold white]-- PROGRESS -----------------[/]"),
                             new Markup($"  [grey]Cycle:[/]  [{cycleBarColor}]{cycleBar}[/] [bold]{cycleProgress,5:0.0}%[/]"),
-                            new Markup($"  [grey]URL  :[/]  [cyan]{urlBar}[/] [bold]{urlProgress,5:0.0}%[/]"),
-                            new Markup($"  [grey]ETA  :[/]  [yellow]{eta:hh\\:mm\\:ss}[/]"),
+                            new Markup($"  [grey]Target:[/] [cyan]{targetBar}[/] [bold]{targetProgress,5:0.0}%[/]"),
+                            new Markup($"  [grey]ETA:  [/]  [yellow]{eta:hh\\:mm\\:ss}[/]"),
                             new Text(""),
-                            new Markup("[bold white]-- CURRENT URL -------------[/]"),
-                            new Markup($"  [grey]{Markup.Escape(Truncate(_uiState.CurrentUrl, 55))}[/]"),
+                            new Markup("[bold white]-- CURRENT TARGET -----------[/]"),
+                            new Markup($"  [grey]{Markup.Escape(Truncate(_uiState.CurrentTargetUrl, 55))}[/]"),
                             new Text(""),
-                            new Markup("[bold white]-- TESTED URLs -------------[/]"),
-                            urlStatusRows,
+                            new Markup("[bold white]-- RECENTLY CHECKED ---------[/]"),
+                            new Rows(checkedList),
                             new Text(""),
-                            new Markup("[bold white]-- CONFIG ------------------[/]"),
-                            new Markup($"  [grey]Threads :[/]  [yellow]{_cfg.ScanThreads}[/]"),
-                            new Markup($"  [grey]Delay   :[/]  [yellow]{_cfg.MdelayMs} ms[/]"),
-                            new Markup($"  [grey]Beep    :[/]  [yellow]{(_cfg.EnableBeep ? "ON" : "OFF")}[/]"),   // ← اصلاح شده
+                            new Markup("[bold white]-- MONITOR CONFIG -----------[/]"),
+                            new Markup($"  [grey]Workers :[/]  [yellow]{_cfg.ParallelWorkers}[/]"),
+                            new Markup($"  [grey]Delay   :[/]  [yellow]{_cfg.RequestDelayMs} ms[/]"),
+                            new Markup($"  [grey]Beep    :[/]  [yellow]{(_cfg.EnableBeep ? "ON" : "OFF")}[/]"),
                             new Markup($"  [grey]Pause   :[/]  [yellow]{(isPaused ? "PAUSED" : "Running")}[/]")
                         );
                         var leftPanel = new Panel(Align.Left(leftContent))
                             .Border(BoxBorder.Rounded).BorderStyle(new Style(Color.Cyan1))
-                            .Header("[bold cyan] STATS [/]").Expand();
+                            .Header("[bold cyan] NETWORK STATUS [/]").Expand();
 
+                        // ── Right Panel (Activity Log) ──
                         var visibleLogs = logs.TakeLast(14).Select(ColorizeLogLine).Cast<IRenderable>().ToArray();
                         IRenderable logContent = visibleLogs.Length > 0
                             ? new Rows(visibleLogs)
-                            : new Markup("[grey]Waiting for data…[/]");
+                            : new Markup("[grey]Waiting for monitoring data…[/]");
                         var logPanel = new Panel(Align.Left(logContent))
                             .Border(BoxBorder.Rounded).BorderStyle(new Style(Color.Grey))
-                            .Header("[bold grey] DATA STREAM [/]").Expand();
+                            .Header("[bold grey] ACTIVITY LOG [/]").Expand();
 
                         layout["Header"].Update(header);
                         layout["Left"].Update(leftPanel);
@@ -752,10 +877,10 @@ public class RDScannerEngine
     private static Markup ColorizeLogLine(string line)
     {
         var safe = Markup.Escape(line);
-        if (line.Contains("✨") || line.Contains("NEW")) return new Markup($"[green]{safe}[/]");
-        if (line.Contains("❌") || line.Contains("Fatal") || line.Contains("error")) return new Markup($"[red]{safe}[/]");
-        if (line.Contains("⚠") || line.Contains("Timeout") || line.Contains("Waiting")) return new Markup($"[yellow]{safe}[/]");
-        if (line.Contains("✅") || line.Contains("Cycle") || line.Contains("Flushed")) return new Markup($"[cyan]{safe}[/]");
+        if (line.Contains("✅") || line.Contains("NEW"))       return new Markup($"[green]{safe}[/]");
+        if (line.Contains("❌") || line.Contains("Fatal"))    return new Markup($"[red]{safe}[/]");
+        if (line.Contains("⚠") || line.Contains("Timeout"))  return new Markup($"[yellow]{safe}[/]");
+        if (line.Contains("▶") || line.Contains("Cycle"))    return new Markup($"[cyan]{safe}[/]");
         return new Markup($"[grey]{safe}[/]");
     }
 
@@ -767,66 +892,72 @@ public class RDScannerEngine
     }
 }
 
-// ═══════════════ HELPERS ═══════════════
-public class UIState
+// ═══════════════ UI SUPPORT CLASSES ═══════════════
+
+public class MonitorUIState
 {
-    public long CycleCount;
-    public int NewThisSession;
-    public int CurrentUrlNum;
-    public string CurrentUrl = "";
-    public double CurrentUrlProgress;
-    public int CurrentUrlFound;
-    public int TestedThisUrl;
+    public long   CycleCount;
+    public int    NewThisSession;
+    public int    CurrentTargetNum;
+    public string CurrentTargetUrl = "";
+    public double CurrentProgress;
+    public int    FoundThisRound;
+    public int    TestedThisRound;
     public string ScanPhase = "Idle";
-    public int SourceConfigCount;
-    public int WorkingConfigCount;
-    public int UrlsCompletedThisCycle;
+    public int    TotalEndpoints;
+    public int    WorkingEndpoints;
+    public int    CompletedChecks;
     public DateTime ScanStartTime = DateTime.Now;
-    public List<UrlTestStatus> UrlStatuses = new();
+    public List<CheckedUrlStatus> CheckedUrls = new();
 }
 
-public class UrlTestStatus
+public class CheckedUrlStatus
 {
-    public string Url { get; init; } = "";
+    public string Url    { get; init; } = "";
     public string Status { get; set; } = "Waiting";
 }
 
 public class PauseManager
 {
-    private readonly ManualResetEventSlim _pauseEvent = new(true);
-    private volatile bool _isPaused;
+    private readonly ManualResetEventSlim _event = new(true);
+    private volatile bool _paused;
 
-    public bool IsPaused => _isPaused;
+    public bool IsPaused => _paused;
 
     public void Pause()
     {
-        _isPaused = true;
-        _pauseEvent.Reset();
+        _paused = true;
+        _event.Reset();
     }
 
     public void Resume()
     {
-        _isPaused = false;
-        _pauseEvent.Set();
+        _paused = false;
+        _event.Set();
     }
 
     public void WaitIfPaused(CancellationToken token)
     {
-        _pauseEvent.Wait(token);
+        _event.Wait(token);
     }
 }
 
+// ═══════════════ PATH HELPER ═══════════════
 public static class PathHelper
 {
+    /// <summary>
+    /// Searches for a folder named RESULTS starting from the application's base directory
+    /// and moving up to the drive root.
+    /// </summary>
     public static string? FindResultsFolder()
     {
-        var baseDir = AppContext.BaseDirectory;
-        while (baseDir != null)
+        var current = AppContext.BaseDirectory;
+        while (current != null)
         {
-            var candidate = Path.Combine(baseDir, "RESULTS");
+            var candidate = Path.Combine(current, "RESULTS");
             if (Directory.Exists(candidate))
                 return candidate;
-            baseDir = Directory.GetParent(baseDir)?.FullName;
+            current = Directory.GetParent(current)?.FullName;
         }
         return null;
     }
