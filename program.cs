@@ -1,5 +1,5 @@
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║              NETWORK AVAILABILITY MONITOR v1.0                 ║
+// ║              NETWORK AVAILABILITY MONITOR v1.3                 ║
 // ║              Professional Network Diagnostic Tool              ║
 // ╚══════════════════════════════════════════════════════════════════╝
 //
@@ -154,7 +154,6 @@ AnsiConsole.MarkupLine($"[yellow]Targets source:[/] {(loadedTargets.Count > 0 ? 
 AnsiConsole.MarkupLine($"[yellow]Endpoint list:[/] {monitorCfg.EndpointListFile}");
 AnsiConsole.MarkupLine($"[yellow]Report file:[/]   {monitorCfg.ReportFile}");
 AnsiConsole.MarkupLine($"[yellow]Network tool:[/]  {monitorCfg.NetworkToolPath}");
-AnsiConsole.MarkupLine($"[grey]Press S for Settings | P for Pause/Resume | Ctrl+C to exit[/]");
 
 // Start the monitor
 var engine = new NetworkMonitorEngine(monitorCfg);
@@ -220,6 +219,12 @@ public class NetworkMonitorEngine
     private readonly string _logFilePath;
     private DateTime _appStartTime = DateTime.Now;
     private CancellationTokenSource? _globalCts;
+    
+    // Settings overlay state
+    private bool _settingsMenuOpen = false;
+    private List<string> _settingsMenuChoices = new();
+    private int _settingsSelectedIndex = 0;
+    private bool _pauseBeforeSettings = false;
 
     // Regular expressions for scrubbing old fragment data
     private static readonly Regex ScrubDateRegex   = new(@"-Seen-.*", RegexOptions.Compiled);
@@ -230,6 +235,9 @@ public class NetworkMonitorEngine
         _cfg = cfg;
         _logFilePath = Path.Combine(
             Path.GetDirectoryName(cfg.ReportFile) ?? ".", "monitor_activity.log");
+        
+        // Pre-build the settings menu so it is never shown empty
+        BuildSettingsMenuChoices();
     }
 
     /// <summary>Main entry point: runs the monitoring loop until cancelled.</summary>
@@ -345,7 +353,7 @@ public class NetworkMonitorEngine
         }
     }
 
-    // ──────────────── Background Key Listener (P + S) ────────────────
+    // ──────────────── Background Key Listener (P + S + Settings Navigation) ────────────────
     private async Task ListenForKeyAsync(CancellationToken token)
     {
         while (!token.IsCancellationRequested)
@@ -353,164 +361,169 @@ public class NetworkMonitorEngine
             if (Console.KeyAvailable)
             {
                 var key = Console.ReadKey(true);
-                if (key.Key == ConsoleKey.P)
+                
+                if (_settingsMenuOpen)
                 {
-                    if (_pauseManager.IsPaused)
+                    // Settings navigation
+                    if (key.Key == ConsoleKey.UpArrow)
+                        _settingsSelectedIndex = Math.Max(0, _settingsSelectedIndex - 1);
+                    else if (key.Key == ConsoleKey.DownArrow)
+                        _settingsSelectedIndex = Math.Min(_settingsMenuChoices.Count - 1, _settingsSelectedIndex + 1);
+                    else if (key.Key == ConsoleKey.Enter)
                     {
-                        _pauseManager.Resume();
-                        await LogAsync("⏯ Monitoring resumed by user", token);
+                        await ExecuteSettingsActionAsync(token);
+                        BuildSettingsMenuChoices(); // Refresh choices after action
                     }
-                    else
+                    else if (key.Key == ConsoleKey.Escape || key.Key == ConsoleKey.S)
                     {
-                        _pauseManager.Pause();
-                        await LogAsync("⏸ Monitoring paused (press P to resume)", token);
+                        CloseSettingsMenu();
                     }
                 }
-                else if (key.Key == ConsoleKey.S)
+                else
                 {
-                    // Pause monitoring before opening settings
-                    bool wasPaused = _pauseManager.IsPaused;
-                    if (!wasPaused)
+                    // Main controls
+                    if (key.Key == ConsoleKey.P)
                     {
-                        _pauseManager.Pause();
-                        await Task.Delay(300, token); // give time for current test to pause
+                        if (_pauseManager.IsPaused)
+                        {
+                            _pauseManager.Resume();
+                            await LogAsync("⏯ Monitoring resumed by user", token);
+                        }
+                        else
+                        {
+                            _pauseManager.Pause();
+                            await LogAsync("⏸ Monitoring paused (press P to resume)", token);
+                        }
                     }
-
-                    await ShowSettingsMenuAsync(token);
-
-                    // Resume only if it was running before
-                    if (!wasPaused)
+                    else if (key.Key == ConsoleKey.S)
                     {
-                        _pauseManager.Resume();
-                        await LogAsync("⏯ Monitoring resumed after settings", token);
+                        OpenSettingsMenu();
                     }
                 }
             }
-            await Task.Delay(100, token);
+            await Task.Delay(50, token);
         }
     }
 
-    // ──────────────── Settings Menu ────────────────
-    private async Task ShowSettingsMenuAsync(CancellationToken token)
+    private void OpenSettingsMenu()
     {
-        // Backup current settings in case user cancels
-        var backupWorkers = _cfg.ParallelWorkers;
-        var backupDelay = _cfg.RequestDelayMs;
-        var backupTimeout = _cfg.GlobalTimeoutSec;
-        var backupBeep = _cfg.EnableBeep;
-        var backupBeepStart = _cfg.BeepDayStart;
-        var backupBeepEnd = _cfg.BeepDayEnd;
-        var backupLogLevel = _cfg.LogLevel;
-
-        while (!token.IsCancellationRequested)
+        // CRITICAL: Build menu BEFORE setting the flag to avoid race condition
+        // that would show an empty settings panel for one frame.
+        BuildSettingsMenuChoices();
+        _settingsSelectedIndex = 0;
+        _pauseBeforeSettings = !_pauseManager.IsPaused;
+        if (_pauseBeforeSettings)
         {
-            AnsiConsole.Clear();
-            
-            var choice = AnsiConsole.Prompt(
-                new SelectionPrompt<string>()
-                    .Title("[bold cyan]⚙️  SETTINGS MENU[/]")
-                    .PageSize(12)
-                    .AddChoices(new[]
-                    {
-                        $"1. Parallel Workers          [yellow]{_cfg.ParallelWorkers}[/]",
-                        $"2. Delay Between Checks      [yellow]{_cfg.RequestDelayMs} ms[/]",
-                        $"3. Global Timeout            [yellow]{_cfg.GlobalTimeoutSec} s[/]",
-                        $"4. Beep Notifications       [yellow]{(_cfg.EnableBeep ? "ON" : "OFF")}[/]",
-                        $"5. Beep Start Hour          [yellow]{_cfg.BeepDayStart}[/]",
-                        $"6. Beep End Hour            [yellow]{_cfg.BeepDayEnd}[/]",
-                        $"7. Log Level                [yellow]{_cfg.LogLevel}[/]",
-                        "8. 💾 Save & Exit",
-                        "9. 🔄 Restore Defaults",
-                        "10. ❌ Exit Without Saving"
-                    }));
+            _pauseManager.Pause();
+        }
+        _settingsMenuOpen = true;
+    }
 
-            if (choice.StartsWith("1."))
+    private void CloseSettingsMenu()
+    {
+        _settingsMenuOpen = false;
+        if (_pauseBeforeSettings)
+        {
+            _pauseManager.Resume();
+        }
+    }
+
+    private void BuildSettingsMenuChoices()
+    {
+        _settingsMenuChoices = new List<string>
+        {
+            $"1. Parallel Workers          [{_cfg.ParallelWorkers}]",
+            $"2. Delay Between Checks      [{_cfg.RequestDelayMs} ms]",
+            $"3. Global Timeout            [{_cfg.GlobalTimeoutSec} s]",
+            $"4. Beep Notifications       [{(_cfg.EnableBeep ? "ON" : "OFF")}]",
+            $"5. Beep Start Hour          [{_cfg.BeepDayStart}]",
+            $"6. Beep End Hour            [{_cfg.BeepDayEnd}]",
+            $"7. Log Level                [{_cfg.LogLevel}]",
+            "8. 💾 Save & Exit",
+            "9. 🔄 Restore Defaults",
+            "10. ❌ Exit Without Saving"
+        };
+    }
+
+    private async Task ExecuteSettingsActionAsync(CancellationToken token)
+    {
+        // Temporarily close overlay to show prompt
+        _settingsMenuOpen = false;
+        
+        try
+        {
+            switch (_settingsSelectedIndex)
             {
-                _cfg.ParallelWorkers = AnsiConsole.Prompt(
-                    new TextPrompt<int>("[green]Number of parallel workers (1-500)[/]:")
-                        .DefaultValue(_cfg.ParallelWorkers)
-                        .Validate(w => w > 0 && w <= 500 ? ValidationResult.Success() : ValidationResult.Error("1-500")));
+                case 0: // Parallel Workers
+                    _cfg.ParallelWorkers = AnsiConsole.Prompt(
+                        new TextPrompt<int>("[green]Number of parallel workers (1-500)[/]:")
+                            .DefaultValue(_cfg.ParallelWorkers)
+                            .Validate(w => w > 0 && w <= 500 ? ValidationResult.Success() : ValidationResult.Error("1-500")));
+                    break;
+                case 1: // Delay
+                    _cfg.RequestDelayMs = AnsiConsole.Prompt(
+                        new TextPrompt<int>("[green]Delay between checks in ms (0-30000)[/]:")
+                            .DefaultValue(_cfg.RequestDelayMs)
+                            .Validate(d => d >= 0 && d <= 30000 ? ValidationResult.Success() : ValidationResult.Error("0-30000")));
+                    break;
+                case 2: // Timeout
+                    _cfg.GlobalTimeoutSec = AnsiConsole.Prompt(
+                        new TextPrompt<int>("[green]Global timeout in seconds (60-3600)[/]:")
+                            .DefaultValue(_cfg.GlobalTimeoutSec)
+                            .Validate(t => t >= 60 && t <= 3600 ? ValidationResult.Success() : ValidationResult.Error("60-3600")));
+                    break;
+                case 3: // Beep
+                    _cfg.EnableBeep = AnsiConsole.Prompt(
+                        new TextPrompt<bool>("[green]Enable beep notifications?[/]")
+                            .DefaultValue(_cfg.EnableBeep)
+                            .WithConverter(b => b ? "Yes" : "No"));
+                    break;
+                case 4: // Beep Start
+                    _cfg.BeepDayStart = AnsiConsole.Prompt(
+                        new TextPrompt<int>("[green]Beep start hour (0-23)[/]:")
+                            .DefaultValue(_cfg.BeepDayStart)
+                            .Validate(h => h >= 0 && h <= 23 ? ValidationResult.Success() : ValidationResult.Error("0-23")));
+                    break;
+                case 5: // Beep End
+                    _cfg.BeepDayEnd = AnsiConsole.Prompt(
+                        new TextPrompt<int>("[green]Beep end hour (0-23)[/]:")
+                            .DefaultValue(_cfg.BeepDayEnd)
+                            .Validate(h => h >= 0 && h <= 23 ? ValidationResult.Success() : ValidationResult.Error("0-23")));
+                    break;
+                case 6: // Log Level
+                    _cfg.LogLevel = AnsiConsole.Prompt(
+                        new SelectionPrompt<string>()
+                            .Title("[green]Select log verbosity level[/]")
+                            .AddChoices(new[] { "Minimal", "Normal", "Verbose" })
+                            .DefaultValue(_cfg.LogLevel));
+                    break;
+                case 7: // Save & Exit
+                    SaveSettingsToJson();
+                    CloseSettingsMenu();
+                    await LogAsync("✅ Settings saved", token);
+                    return; // No need to reopen overlay
+                case 8: // Restore Defaults
+                    _cfg.ParallelWorkers = 100;
+                    _cfg.RequestDelayMs = 7000;
+                    _cfg.GlobalTimeoutSec = 500;
+                    _cfg.EnableBeep = true;
+                    _cfg.BeepDayStart = 12;
+                    _cfg.BeepDayEnd = 24;
+                    _cfg.LogLevel = "Normal";
+                    if (File.Exists(_cfg.ConfigFilePath)) File.Delete(_cfg.ConfigFilePath);
+                    await LogAsync("✅ Settings restored to defaults", token);
+                    break;
+                case 9: // Exit Without Saving
+                    CloseSettingsMenu();
+                    await LogAsync("⚡ Settings menu closed without saving", token);
+                    return; // No need to reopen overlay
             }
-            else if (choice.StartsWith("2."))
-            {
-                _cfg.RequestDelayMs = AnsiConsole.Prompt(
-                    new TextPrompt<int>("[green]Delay between checks in ms (0-30000)[/]:")
-                        .DefaultValue(_cfg.RequestDelayMs)
-                        .Validate(d => d >= 0 && d <= 30000 ? ValidationResult.Success() : ValidationResult.Error("0-30000")));
-            }
-            else if (choice.StartsWith("3."))
-            {
-                _cfg.GlobalTimeoutSec = AnsiConsole.Prompt(
-                    new TextPrompt<int>("[green]Global timeout in seconds (60-3600)[/]:")
-                        .DefaultValue(_cfg.GlobalTimeoutSec)
-                        .Validate(t => t >= 60 && t <= 3600 ? ValidationResult.Success() : ValidationResult.Error("60-3600")));
-            }
-            else if (choice.StartsWith("4."))
-            {
-                _cfg.EnableBeep = AnsiConsole.Prompt(
-                    new TextPrompt<bool>("[green]Enable beep notifications?[/]")
-                        .DefaultValue(_cfg.EnableBeep)
-                        .WithConverter(b => b ? "Yes" : "No"));
-            }
-            else if (choice.StartsWith("5."))
-            {
-                _cfg.BeepDayStart = AnsiConsole.Prompt(
-                    new TextPrompt<int>("[green]Beep start hour (0-23)[/]:")
-                        .DefaultValue(_cfg.BeepDayStart)
-                        .Validate(h => h >= 0 && h <= 23 ? ValidationResult.Success() : ValidationResult.Error("0-23")));
-            }
-            else if (choice.StartsWith("6."))
-            {
-                _cfg.BeepDayEnd = AnsiConsole.Prompt(
-                    new TextPrompt<int>("[green]Beep end hour (0-23)[/]:")
-                        .DefaultValue(_cfg.BeepDayEnd)
-                        .Validate(h => h >= 0 && h <= 23 ? ValidationResult.Success() : ValidationResult.Error("0-23")));
-            }
-            else if (choice.StartsWith("7."))
-            {
-                _cfg.LogLevel = AnsiConsole.Prompt(
-                    new SelectionPrompt<string>()
-                        .Title("[green]Select log verbosity level[/]")
-                        .AddChoices(new[] { "Minimal", "Normal", "Verbose" })
-                        .DefaultValue(_cfg.LogLevel));
-            }
-            else if (choice.StartsWith("8.")) // Save & Exit
-            {
-                SaveSettingsToJson();
-                AnsiConsole.MarkupLine("[green]✅ Settings saved. Resuming monitoring...[/]");
-                await Task.Delay(1000, token);
-                break;
-            }
-            else if (choice.StartsWith("9.")) // Restore Defaults
-            {
-                _cfg.ParallelWorkers = 100;
-                _cfg.RequestDelayMs = 7000;
-                _cfg.GlobalTimeoutSec = 500;
-                _cfg.EnableBeep = true;
-                _cfg.BeepDayStart = 12;
-                _cfg.BeepDayEnd = 24;
-                _cfg.LogLevel = "Normal";
-                
-                if (File.Exists(_cfg.ConfigFilePath))
-                    File.Delete(_cfg.ConfigFilePath);
-                
-                AnsiConsole.MarkupLine("[green]✅ Settings restored to defaults.[/]");
-                await Task.Delay(1000, token);
-            }
-            else if (choice.StartsWith("10.")) // Exit Without Saving
-            {
-                _cfg.ParallelWorkers = backupWorkers;
-                _cfg.RequestDelayMs = backupDelay;
-                _cfg.GlobalTimeoutSec = backupTimeout;
-                _cfg.EnableBeep = backupBeep;
-                _cfg.BeepDayStart = backupBeepStart;
-                _cfg.BeepDayEnd = backupBeepEnd;
-                _cfg.LogLevel = backupLogLevel;
-                
-                AnsiConsole.MarkupLine("[yellow]⚠ Changes discarded. Resuming monitoring...[/]");
-                await Task.Delay(1000, token);
-                break;
-            }
+        }
+        finally
+        {
+            // Reopen overlay after action (unless Save/Exit was chosen)
+            if (_settingsSelectedIndex != 7 && _settingsSelectedIndex != 9)
+                _settingsMenuOpen = true;
         }
     }
 
@@ -643,6 +656,9 @@ public class NetworkMonitorEngine
     // ──────────────── Main Health‑Check Logic ────────────────
     private async Task CheckTargetAgainstEndpointsAsync(string targetUrl, CancellationToken token)
     {
+        // Check cancellation before doing any work
+        token.ThrowIfCancellationRequested();
+
         // Clean up any leftover temporary file
         if (File.Exists(_cfg.TempOutput))
             try { File.Delete(_cfg.TempOutput); } catch { }
@@ -709,7 +725,7 @@ public class NetworkMonitorEngine
         proc.BeginErrorReadLine();
 
         using var monitorCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-        var monitorTask = MonitorProgressLoopAsync(proc, monitorCts.Token);
+        var monitorTask = MonitorProgressLoopAsync(proc, monitorCts.Token, _pauseManager);
 
         try
         {
@@ -791,12 +807,14 @@ public class NetworkMonitorEngine
         try { File.Delete(_cfg.TempOutput); } catch { }
     }
 
-    // ──────────────── Progress Monitor (background) ────────────────
-    private async Task MonitorProgressLoopAsync(Process proc, CancellationToken token)
+    // ──────────────── Progress Monitor (background, respects pause) ────────────────
+    private async Task MonitorProgressLoopAsync(Process proc, CancellationToken token, PauseManager pauseManager)
     {
         while (!token.IsCancellationRequested && !proc.HasExited)
         {
+            pauseManager.WaitIfPaused(token);   // freeze progress when paused
             token.ThrowIfCancellationRequested();
+            
             double progress = _uiState.WorkingEndpoints > 0
                 ? (_uiState.TestedThisRound / (double)_uiState.WorkingEndpoints) * 100.0
                 : 0;
@@ -914,7 +932,7 @@ public class NetworkMonitorEngine
         var logs = new List<string>(MaxLogLines);
         var layout = new Layout("Root")
             .SplitRows(
-                new Layout("Header").Size(3),
+                new Layout("Header").Size(4),   // increased to show shortcuts line
                 new Layout("Main").SplitColumns(
                     new Layout("Left").Size(60),
                     new Layout("Right")));
@@ -957,14 +975,13 @@ public class NetworkMonitorEngine
                                        : _uiState.ScanPhase is "Waiting" or "Idle" ? "yellow" : "cyan";
                         var pauseInfo = isPaused ? " [bold red]⏸ PAUSED[/]" : "";
 
-                        // ── Header ──
+                        // ── Header (with keyboard shortcuts) ──
                         var headerMarkup =
                             $"[bold cyan]🌐 NETWORK AVAILABILITY MONITOR[/]{pauseInfo}   " +
                             $"[bold {phaseColor}]● {Markup.Escape(_uiState.ScanPhase.ToUpper())}[/]   " +
                             $"[grey]UPTIME {uptime:hh\\:mm\\:ss}[/]   " +
-                            $"[bold green]RESPONSIVE {_responsiveServers.Count:N0}[/]  " +
-                            $"[cyan]CYCLE {_uiState.CycleCount}[/]  " +
-                            $"[yellow]TARGET {_uiState.CurrentTargetNum}/{totalTargets}[/]";
+                            $"[bold green]RESPONSIVE {_responsiveServers.Count:N0}[/]\n" +
+                            $"[grey]P: Pause/Resume | S: Settings | Esc: Close Settings | Ctrl+C: Exit[/]";
                         var header = new Panel(Align.Center(new Markup(headerMarkup)))
                             .Border(BoxBorder.Heavy).BorderStyle(new Style(Color.Cyan1)).Expand();
 
@@ -1019,18 +1036,44 @@ public class NetworkMonitorEngine
                             .Border(BoxBorder.Rounded).BorderStyle(new Style(Color.Cyan1))
                             .Header("[bold cyan] NETWORK STATUS [/]").Expand();
 
-                        // ── Right Panel (Activity Log) ──
-                        var visibleLogs = logs.TakeLast(14).Select(ColorizeLogLine).Cast<IRenderable>().ToArray();
-                        IRenderable logContent = visibleLogs.Length > 0
-                            ? new Rows(visibleLogs)
-                            : new Markup("[grey]Waiting for monitoring data…[/]");
-                        var logPanel = new Panel(Align.Left(logContent))
-                            .Border(BoxBorder.Rounded).BorderStyle(new Style(Color.Grey))
-                            .Header("[bold grey] ACTIVITY LOG [/]").Expand();
+                        // ── Right Panel (Activity Log or Settings Menu) ──
+                        IRenderable rightContent;
+                        
+                        if (_settingsMenuOpen)
+                        {
+                            // Build settings menu as an overlay
+                            var settingsLines = new List<IRenderable>();
+                            settingsLines.Add(new Markup($"[bold yellow]⚙️  SETTINGS MENU (↑↓: Navigate, Enter: Select, Esc/S: Close)[/]"));
+                            settingsLines.Add(new Text(""));
+                            
+                            for (int i = 0; i < _settingsMenuChoices.Count; i++)
+                            {
+                                var prefix = i == _settingsSelectedIndex ? "[cyan]> [/]" : "  ";
+                                var text = i == _settingsSelectedIndex
+                                    ? $"[bold cyan]{_settingsMenuChoices[i]}[/]"
+                                    : $"[grey]{_settingsMenuChoices[i]}[/]";
+                                settingsLines.Add(new Markup($"{prefix}{text}"));
+                            }
+                            
+                            rightContent = new Panel(Align.Left(new Rows(settingsLines)))
+                                .Border(BoxBorder.Rounded).BorderStyle(new Style(Color.Yellow))
+                                .Header("[bold yellow] SETTINGS [/]").Expand();
+                        }
+                        else
+                        {
+                            // Normal activity log
+                            var visibleLogs = logs.TakeLast(14).Select(ColorizeLogLine).Cast<IRenderable>().ToArray();
+                            rightContent = visibleLogs.Length > 0
+                                ? new Rows(visibleLogs)
+                                : new Markup("[grey]Waiting for monitoring data…[/]");
+                            rightContent = new Panel(Align.Left(rightContent))
+                                .Border(BoxBorder.Rounded).BorderStyle(new Style(Color.Grey))
+                                .Header("[bold grey] ACTIVITY LOG [/]").Expand();
+                        }
 
                         layout["Header"].Update(header);
                         layout["Left"].Update(leftPanel);
-                        layout["Right"].Update(logPanel);
+                        layout["Right"].Update(rightContent);
 
                         ctx.Refresh();
                         try { await Task.Delay(250, token); } catch (OperationCanceledException) { break; }
