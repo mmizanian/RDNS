@@ -819,9 +819,10 @@ public class NetworkMonitorEngine
                 new Layout("Header").Size(4),
                 new Layout("Main").SplitColumns(new Layout("Left").Size(60), new Layout("Right")));
 
-        // CRITICAL FIX: wrap Live in using so it disposes and restores terminal state,
+        // CRITICAL FIX: explicitly dispose Live so it restores terminal state,
         // allowing the settings menu to accept key input after the dashboard stops.
-        using LiveDisplay live = AnsiConsole.Live(layout).AutoClear(true).Overflow(VerticalOverflow.Ellipsis);
+        var live = AnsiConsole.Live(layout).AutoClear(true).Overflow(VerticalOverflow.Ellipsis);
+        try
         {
             await live.StartAsync(async ctx =>
             {
