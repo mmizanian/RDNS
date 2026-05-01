@@ -33,7 +33,6 @@
 //   or network monitoring suites used in enterprise IT environments.
 //
 
-
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -605,7 +604,7 @@ public class NetworkMonitorEngine
                     Interlocked.Increment(ref _uiState.NewThisSession);
                     Interlocked.Increment(ref _uiState.FoundThisRound);
                     await _alertChannel.Writer.WriteAsync(outputLine, token);
-                    await AppendToReportAsync(outputLine, token);
+                    // No longer appending to file here; full file is rewritten on debounced save.
                 }
                 else
                 {
@@ -653,29 +652,22 @@ public class NetworkMonitorEngine
                 try
                 {
                     await Task.Delay(5000, token);
-                    await SaveReportSortedAsync();
+                    await SaveReportSortedAsync(token);
                 }
                 catch (TaskCanceledException) { }
             }, token);
         }
     }
 
-    private async Task AppendToReportAsync(string line, CancellationToken token)
+    private async Task SaveReportSortedAsync(CancellationToken token = default)
     {
         await _fileLock.WaitAsync(token);
-        try { await File.AppendAllTextAsync(_cfg.ReportFile, line + Environment.NewLine, token); }
-        finally { _fileLock.Release(); }
-    }
-
-    private async Task SaveReportSortedAsync()
-    {
-        await _fileLock.WaitAsync();
         try
         {
             var sorted = _responsiveServers.Values
                 .OrderByDescending(ExtractTimestamp)
                 .ToList();
-            await File.WriteAllLinesAsync(_cfg.ReportFile, sorted);
+            await File.WriteAllLinesAsync(_cfg.ReportFile, sorted, token);
         }
         finally { _fileLock.Release(); }
     }
@@ -811,17 +803,20 @@ public class NetworkMonitorEngine
                         var targetBar = BuildBar(targetProgress, 24);
 
                         var checkedList = new List<IRenderable>();
-                        if (_uiState.CheckedUrls.Count > 0)
+                        lock (_uiState.CheckedUrls)   // thread‑safe read for the dashboard
                         {
-                            foreach (var u in _uiState.CheckedUrls.TakeLast(5).Reverse())
+                            if (_uiState.CheckedUrls.Count > 0)
                             {
-                                var mark = u.Status == "Done" ? "[green]✓[/]" :
-                                           u.Status == "Testing" ? "[yellow]⏳[/]" : "[grey]…[/]";
-                                checkedList.Add(new Markup($"  {mark} {Markup.Escape(Truncate(u.Url, 50))}"));
+                                foreach (var u in _uiState.CheckedUrls.TakeLast(5).Reverse())
+                                {
+                                    var mark = u.Status == "Done" ? "[green]✓[/]" :
+                                               u.Status == "Testing" ? "[yellow]⏳[/]" : "[grey]…[/]";
+                                    checkedList.Add(new Markup($"  {mark} {Markup.Escape(Truncate(u.Url, 50))}"));
+                                }
                             }
+                            else
+                                checkedList.Add(new Markup("  [grey]No targets checked yet[/]"));
                         }
-                        else
-                            checkedList.Add(new Markup("  [grey]No targets checked yet[/]"));
 
                         var leftContent = new Rows(
                             new Markup("[bold white]-- AVAILABILITY REPORT ------[/]"),
