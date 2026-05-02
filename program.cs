@@ -57,7 +57,7 @@ using Spectre.Console.Rendering;
 // Health‑check targets are loaded from "targets.txt" in the RESULTS folder
 // (one URL per line, lines starting with # are ignored). If that file is
 // missing or empty, a default set of well‑known public URLs is used.
-// A JSON config file "network_monitor_config.json" can override both.
+// A JSON config file "network_monitor_config.json" can override all settings.
 // ════════════════════════════════════════════════════════════════════
 
 // ===== DEFAULT HEALTH‑CHECK TARGETS (fallback) =====
@@ -106,17 +106,14 @@ IEnumerable<string> activeTargets = loadedTargets.Count > 0
 
 // ===== 2. Override with JSON config if present =====
 string configFilePath = Path.Combine(resultsDir, "network_monitor_config.json");
+MonitorSettingsDto? savedSettings = null;
 if (File.Exists(configFilePath))
 {
     try
     {
-        var json = File.ReadAllText(configFilePath);
-        var cfgFromFile = JsonSerializer.Deserialize<MonitorConfigFile>(json);
-        if (cfgFromFile?.HealthCheckTargets?.Length > 0)
-        {
-            activeTargets = cfgFromFile.HealthCheckTargets;
-            AnsiConsole.MarkupLine("[green]Loaded custom health‑check targets from JSON config.[/]");
-        }
+        string json = await File.ReadAllTextAsync(configFilePath);
+        savedSettings = JsonSerializer.Deserialize<MonitorSettingsDto>(json);
+        AnsiConsole.MarkupLine("[green]Loaded custom settings from network_monitor_config.json[/]");
     }
     catch (Exception ex)
     {
@@ -124,16 +121,19 @@ if (File.Exists(configFilePath))
     }
 }
 
-// Build the monitor configuration
+// Build effective configuration, falling back to defaults
 var monitorCfg = new MonitorConfiguration
 {
-    HealthCheckTargets = activeTargets.ToArray(),
-    ParallelWorkers = 50,
-    RequestDelayMs = 7000,
-    GlobalTimeoutSec = 500,
-    EnableBeep = true,
-    BeepDayStart = 12,
-    BeepDayEnd = 24
+    HealthCheckTargets = (savedSettings?.HealthCheckTargets?.Length > 0
+                          ? savedSettings.HealthCheckTargets
+                          : activeTargets.ToArray()),
+    ParallelWorkers    = savedSettings?.ParallelWorkers    ?? 50,
+    RequestDelayMs     = savedSettings?.RequestDelayMs     ?? 7000,
+    GlobalTimeoutSec   = savedSettings?.GlobalTimeoutSec   ?? 500,
+    EnableBeep         = savedSettings?.EnableBeep         ?? true,
+    BeepDayStart       = savedSettings?.BeepDayStart       ?? 12,
+    BeepDayEnd         = savedSettings?.BeepDayEnd         ?? 23,
+    LogVerbosityLevel  = savedSettings?.LogVerbosityLevel  ?? "Normal"
 };
 
 // Resolve file paths (all inside the RESULTS folder)
@@ -151,17 +151,17 @@ AnsiConsole.MarkupLine($"[yellow]Endpoint list:[/] {monitorCfg.EndpointListFile}
 AnsiConsole.MarkupLine($"[yellow]Report file:[/]   {monitorCfg.ReportFile}");
 AnsiConsole.MarkupLine($"[yellow]Network tool:[/]  {monitorCfg.NetworkToolPath}");
 
-// Interactive prompts with validation
+// Interactive prompts with validation (show current values as defaults)
 monitorCfg.ParallelWorkers = AnsiConsole.Prompt(
     new TextPrompt<int>("[green]Number of parallel workers (1-500)[/]:")
-        .DefaultValue(100)
+        .DefaultValue(monitorCfg.ParallelWorkers)
         .Validate(w => w > 0 && w <= 500
             ? ValidationResult.Success()
             : ValidationResult.Error("Enter 1-500")));
 
 monitorCfg.RequestDelayMs = AnsiConsole.Prompt(
     new TextPrompt<int>("[green]Delay between health checks in ms (0-30000)[/]:")
-        .DefaultValue(7000)
+        .DefaultValue(monitorCfg.RequestDelayMs)
         .Validate(d => d >= 0 && d <= 30000
             ? ValidationResult.Success()
             : ValidationResult.Error("Enter 0-30000")));
@@ -189,12 +189,20 @@ public class MonitorConfiguration
     public bool     EnableBeep          { get; set; }
     public int      BeepDayStart        { get; set; }
     public int      BeepDayEnd          { get; set; }
+    public string   LogVerbosityLevel   { get; set; } = "Normal";
 }
 
-/// <summary>Helper class for deserializing the external config file.</summary>
-public class MonitorConfigFile
+/// <summary>Helper class for deserializing the external config file (user‑facing settings only).</summary>
+public class MonitorSettingsDto
 {
-    public string[] HealthCheckTargets { get; set; } = Array.Empty<string>();
+    public string[] HealthCheckTargets  { get; set; } = Array.Empty<string>();
+    public int      ParallelWorkers     { get; set; }
+    public int      RequestDelayMs      { get; set; }
+    public int      GlobalTimeoutSec    { get; set; }
+    public bool     EnableBeep          { get; set; }
+    public int      BeepDayStart        { get; set; }
+    public int      BeepDayEnd          { get; set; }
+    public string   LogVerbosityLevel   { get; set; } = "Normal";
 }
 
 // ═══════════════════ ENGINE ═══════════════════
@@ -220,6 +228,10 @@ public class NetworkMonitorEngine
     private readonly MonitorUIState _uiState = new();
     private readonly string _logFilePath;
     private DateTime _appStartTime = DateTime.Now;
+
+    // Dashboard lifecycle
+    private Task? _dashboardTask;
+    private CancellationTokenSource? _dashboardCts;
 
     // Regular expressions for scrubbing old fragment data
     private static readonly Regex ScrubDateRegex   = new(@"-Seen-.*", RegexOptions.Compiled);
@@ -254,9 +266,12 @@ public class NetworkMonitorEngine
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
 
-            // Start background tasks
-            var keyTask   = ListenForPauseKeyAsync(cts.Token);
-            var uiTask    = RunDashboardAsync(cts.Token);
+            // Start dashboard
+            _dashboardCts = new CancellationTokenSource();
+            _dashboardTask = RunDashboardAsync(_dashboardCts.Token);
+
+            // Background tasks
+            var keyTask   = ListenForKeyPressesAsync(cts.Token);
             var alertTask = ProcessAlertsAsync(cts.Token);
 
             // Main monitoring loop
@@ -302,7 +317,6 @@ public class NetworkMonitorEngine
                     await CheckTargetAgainstEndpointsAsync(_uiState.CurrentTargetUrl, cts.Token);
                     _uiState.CompletedChecks = i + 1;
 
-                    // Update the "checked URLs" status list for the dashboard
                     lock (_uiState.CheckedUrls)
                     {
                         var entry = _uiState.CheckedUrls.FirstOrDefault(u => u.Url == _uiState.CurrentTargetUrl);
@@ -328,7 +342,7 @@ public class NetworkMonitorEngine
             cts.Cancel();
             _alertChannel.Writer.Complete();
             _logChannel.Writer.Complete();
-            try { await Task.WhenAll(uiTask, alertTask, keyTask); } catch { }
+            try { await Task.WhenAll(_dashboardTask ?? Task.CompletedTask, alertTask, keyTask); } catch { }
         }
         catch (OperationCanceledException) { /* graceful shutdown */ }
         catch (Exception ex)
@@ -340,11 +354,16 @@ public class NetworkMonitorEngine
         {
             _alertChannel.Writer.TryComplete();
             _logChannel.Writer.TryComplete();
+            _dashboardCts?.Cancel();
+            if (_dashboardTask != null)
+            {
+                try { await _dashboardTask; } catch { }
+            }
         }
     }
 
-    // ──────────────── Background Key Listener ────────────────
-    private async Task ListenForPauseKeyAsync(CancellationToken token)
+    // ──────────────── Key Listener (Pause + Settings) ────────────────
+    private async Task ListenForKeyPressesAsync(CancellationToken token)
     {
         while (!token.IsCancellationRequested)
         {
@@ -364,9 +383,213 @@ public class NetworkMonitorEngine
                         await LogAsync("⏸ Monitoring paused (press P to resume)", token);
                     }
                 }
+                else if (key.Key == ConsoleKey.S)
+                {
+                    // Trigger settings menu (the call itself is blocking until menu closes)
+                    await RunSettingsMenuAsync(token);
+                }
             }
             await Task.Delay(100, token);
         }
+    }
+
+    // ──────────────── Settings Menu ────────────────
+    private async Task RunSettingsMenuAsync(CancellationToken mainToken)
+    {
+        // 1. Record original pause state and pause if not already
+        bool wasPaused = _pauseManager.IsPaused;
+        if (!wasPaused)
+            _pauseManager.Pause();
+
+        // 2. Clone current configuration for "revert" option
+        MonitorConfiguration originalCfg = CloneConfiguration(_cfg);
+
+        // 3. Stop live dashboard
+        _dashboardCts?.Cancel();
+        if (_dashboardTask != null)
+        {
+            try { await _dashboardTask; } catch (OperationCanceledException) { }
+        }
+
+        // 4. Show the settings menu
+        try
+        {
+            AnsiConsole.Clear();
+            var editCfg = CloneConfiguration(_cfg); // we'll modify this copy
+            bool saved = false;
+            bool discard = false;
+
+            while (!saved && !discard && !mainToken.IsCancellationRequested)
+            {
+                var choice = AnsiConsole.Prompt(
+                    new SelectionPrompt<string>()
+                        .Title("[bold yellow]⚙ Settings[/]")
+                        .AddChoices(new[]
+                        {
+                            $"1. Parallel Workers        : [cyan]{editCfg.ParallelWorkers}[/]",
+                            $"2. Delay Between Checks ms : [cyan]{editCfg.RequestDelayMs}[/]",
+                            $"3. Global Timeout sec      : [cyan]{editCfg.GlobalTimeoutSec}[/]",
+                            $"4. Beep Notifications      : [cyan]{(editCfg.EnableBeep ? "ON" : "OFF")}[/]",
+                            $"5. Beep Start Hour (0-23)  : [cyan]{editCfg.BeepDayStart}[/]",
+                            $"6. Beep End Hour (0-23)    : [cyan]{editCfg.BeepDayEnd}[/]",
+                            $"7. Log Verbosity           : [cyan]{editCfg.LogVerbosityLevel}[/]",
+                            "  [green]💾 Save & Exit[/]",
+                            "  [yellow]🔄 Restore Defaults[/]",
+                            "  [red]❌ Exit Without Saving[/]"
+                        }));
+
+                switch (choice)
+                {
+                    case string s when s.StartsWith("1."):
+                        editCfg.ParallelWorkers = AnsiConsole.Prompt(
+                            new TextPrompt<int>("Parallel Workers (1-500):")
+                                .DefaultValue(editCfg.ParallelWorkers)
+                                .Validate(w => w > 0 && w <= 500 ? ValidationResult.Success() : ValidationResult.Error("1-500")));
+                        break;
+                    case string s when s.StartsWith("2."):
+                        editCfg.RequestDelayMs = AnsiConsole.Prompt(
+                            new TextPrompt<int>("Delay Between Checks ms (0-30000):")
+                                .DefaultValue(editCfg.RequestDelayMs)
+                                .Validate(d => d >= 0 && d <= 30000 ? ValidationResult.Success() : ValidationResult.Error("0-30000")));
+                        break;
+                    case string s when s.StartsWith("3."):
+                        editCfg.GlobalTimeoutSec = AnsiConsole.Prompt(
+                            new TextPrompt<int>("Global Timeout sec (60-3600):")
+                                .DefaultValue(editCfg.GlobalTimeoutSec)
+                                .Validate(t => t >= 60 && t <= 3600 ? ValidationResult.Success() : ValidationResult.Error("60-3600")));
+                        break;
+                    case string s when s.StartsWith("4."):
+                        editCfg.EnableBeep = !editCfg.EnableBeep;
+                        AnsiConsole.MarkupLine($"[grey]Beep Notifications toggled to {(editCfg.EnableBeep ? "ON" : "OFF")}[/]");
+                        break;
+                    case string s when s.StartsWith("5."):
+                        editCfg.BeepDayStart = AnsiConsole.Prompt(
+                            new TextPrompt<int>("Beep Start Hour (0-23):")
+                                .DefaultValue(editCfg.BeepDayStart)
+                                .Validate(h => h >= 0 && h <= 23 ? ValidationResult.Success() : ValidationResult.Error("0-23")));
+                        break;
+                    case string s when s.StartsWith("6."):
+                        editCfg.BeepDayEnd = AnsiConsole.Prompt(
+                            new TextPrompt<int>("Beep End Hour (0-23):")
+                                .DefaultValue(editCfg.BeepDayEnd)
+                                .Validate(h => h >= 0 && h <= 23 ? ValidationResult.Success() : ValidationResult.Error("0-23")));
+                        break;
+                    case string s when s.StartsWith("7."):
+                        editCfg.LogVerbosityLevel = AnsiConsole.Prompt(
+                            new SelectionPrompt<string>()
+                                .Title("Log Verbosity Level:")
+                                .AddChoices("Minimal", "Normal", "Verbose"));
+                        break;
+                    case string s when s.Contains("Save"):
+                        // Apply changes to the running config
+                        ApplyConfiguration(editCfg, _cfg);
+                        await SaveSettingsToFileAsync(_cfg);
+                        saved = true;
+                        break;
+                    case string s when s.Contains("Restore"):
+                        // Reset to hard-coded defaults
+                        var defaults = CreateDefaultConfiguration();
+                        ApplyConfiguration(defaults, editCfg);
+                        ApplyConfiguration(defaults, _cfg);
+                        try { File.Delete(Path.Combine(Path.GetDirectoryName(_cfg.ReportFile) ?? "", "network_monitor_config.json")); } catch { }
+                        AnsiConsole.MarkupLine("[green]Defaults restored. Config file deleted if existed.[/]");
+                        // After restore, we still stay in the menu so the user can see the changes;
+                        // they can then choose Save or Exit. This is by design.
+                        break;
+                    case string s when s.Contains("Exit"):
+                        // Discard changes: revert to original
+                        ApplyConfiguration(originalCfg, _cfg);
+                        discard = true;
+                        break;
+                }
+            }
+        }
+        finally
+        {
+            // 5. Restart dashboard
+            _dashboardCts = new CancellationTokenSource();
+            _dashboardTask = RunDashboardAsync(_dashboardCts.Token);
+
+            // 6. Restore pause state (unless it was already paused)
+            if (!wasPaused)
+                _pauseManager.Resume();
+        }
+    }
+
+    // ──────────────── Configuration helpers ────────────────
+    private static MonitorConfiguration CloneConfiguration(MonitorConfiguration source) =>
+        new()
+        {
+            ParallelWorkers    = source.ParallelWorkers,
+            RequestDelayMs     = source.RequestDelayMs,
+            GlobalTimeoutSec   = source.GlobalTimeoutSec,
+            EnableBeep         = source.EnableBeep,
+            BeepDayStart       = source.BeepDayStart,
+            BeepDayEnd         = source.BeepDayEnd,
+            LogVerbosityLevel  = source.LogVerbosityLevel,
+            HealthCheckTargets = source.HealthCheckTargets.ToArray(),
+            // The following are not user‑editable, just copy references
+            EndpointListFile   = source.EndpointListFile,
+            ReportFile         = source.ReportFile,
+            NetworkToolPath    = source.NetworkToolPath,
+            DedupedFile        = source.DedupedFile,
+            SnapshotFile       = source.SnapshotFile,
+            TempOutput         = source.TempOutput,
+            BlacklistFile      = source.BlacklistFile
+        };
+
+    private static void ApplyConfiguration(MonitorConfiguration from, MonitorConfiguration to)
+    {
+        to.ParallelWorkers    = from.ParallelWorkers;
+        to.RequestDelayMs     = from.RequestDelayMs;
+        to.GlobalTimeoutSec   = from.GlobalTimeoutSec;
+        to.EnableBeep         = from.EnableBeep;
+        to.BeepDayStart       = from.BeepDayStart;
+        to.BeepDayEnd         = from.BeepDayEnd;
+        to.LogVerbosityLevel  = from.LogVerbosityLevel;
+        to.HealthCheckTargets = from.HealthCheckTargets.ToArray();
+    }
+
+    private static MonitorConfiguration CreateDefaultConfiguration() =>
+        new()
+        {
+            ParallelWorkers    = 50,
+            RequestDelayMs     = 7000,
+            GlobalTimeoutSec   = 500,
+            EnableBeep         = true,
+            BeepDayStart       = 12,
+            BeepDayEnd         = 23,
+            LogVerbosityLevel  = "Normal",
+            HealthCheckTargets = new[]
+            {
+                "https://www.wikipedia.org/robots.txt",
+                "https://www.github.com/robots.txt",
+                "https://www.stackoverflow.com/robots.txt",
+                "https://www.cloudflare.com/robots.txt",
+                "https://www.apache.org/robots.txt",
+                "https://www.mozilla.org/robots.txt",
+                "https://www.gnu.org/robots.txt",
+                "https://www.w3.org/robots.txt",
+                "https://www.ietf.org/robots.txt",
+                "https://www.archlinux.org/robots.txt"
+            }
+        };
+
+    private async Task SaveSettingsToFileAsync(MonitorConfiguration cfg)
+    {
+        var dto = new MonitorSettingsDto
+        {
+            HealthCheckTargets = cfg.HealthCheckTargets,
+            ParallelWorkers    = cfg.ParallelWorkers,
+            RequestDelayMs     = cfg.RequestDelayMs,
+            GlobalTimeoutSec   = cfg.GlobalTimeoutSec,
+            EnableBeep         = cfg.EnableBeep,
+            BeepDayStart       = cfg.BeepDayStart,
+            BeepDayEnd         = cfg.BeepDayEnd,
+            LogVerbosityLevel  = cfg.LogVerbosityLevel
+        };
+        string path = Path.Combine(Path.GetDirectoryName(cfg.ReportFile) ?? ".", "network_monitor_config.json");
+        await File.WriteAllTextAsync(path, JsonSerializer.Serialize(dto, new JsonSerializerOptions { WriteIndented = true }));
     }
 
     // ──────────────── Blacklist Management ────────────────
@@ -473,21 +696,18 @@ public class NetworkMonitorEngine
     // ──────────────── Main Health‑Check Logic ────────────────
     private async Task CheckTargetAgainstEndpointsAsync(string targetUrl, CancellationToken token)
     {
-        // Clean up any leftover temporary file
         if (File.Exists(_cfg.TempOutput))
             try { File.Delete(_cfg.TempOutput); } catch { }
 
         _uiState.ScanPhase = "Launching";
         await LogAsync($"▶ Launching check: {Truncate(targetUrl, 50)}", token);
 
-        // Estimate timeout dynamically based on endpoint count and delay
         double estimatedSeconds = 0;
         if (_uiState.WorkingEndpoints > 0 && _cfg.ParallelWorkers > 0)
             estimatedSeconds = (_uiState.WorkingEndpoints / (double)_cfg.ParallelWorkers) *
                                (_cfg.RequestDelayMs / 1000.0);
         int dynamicTimeoutSec = Math.Max(_cfg.GlobalTimeoutSec, (int)estimatedSeconds + 120);
 
-        // Build command‑line arguments for the network testing tool
         var args = $"http -f \"{_cfg.DedupedFile}\" --thread {_cfg.ParallelWorkers} " +
                    $"--mdelay {_cfg.RequestDelayMs} --insecure=true " +
                    $"--url \"{targetUrl}\" -o \"{_cfg.TempOutput}\"";
@@ -503,7 +723,6 @@ public class NetworkMonitorEngine
             WorkingDirectory = AppContext.BaseDirectory
         };
 
-        // Remove any proxy environment variables to avoid interference
         psi.Environment.Remove("HTTP_PROXY");
         psi.Environment.Remove("HTTPS_PROXY");
         psi.Environment.Remove("http_proxy");
@@ -572,7 +791,6 @@ public class NetworkMonitorEngine
         if (!string.IsNullOrWhiteSpace(errorText) && proc.ExitCode != 0)
             await LogAsync($"⚠ Tool warning (code {proc.ExitCode}): {Truncate(errorText, 100)}", token);
 
-        // Process the output file
         if (File.Exists(_cfg.TempOutput))
         {
             var lines = await File.ReadAllLinesAsync(_cfg.TempOutput, token);
@@ -583,7 +801,6 @@ public class NetworkMonitorEngine
                 var (endpointId, endpointName) = SplitFragment(line);
                 if (string.IsNullOrEmpty(endpointId)) continue;
 
-                // Blacklist filtering
                 if (_blacklist.Count > 0 && _blacklist.Any(pattern =>
                     endpointId.Contains(pattern, StringComparison.OrdinalIgnoreCase) ||
                     endpointName.Contains(pattern, StringComparison.OrdinalIgnoreCase)))
@@ -592,7 +809,6 @@ public class NetworkMonitorEngine
                     continue;
                 }
 
-                // Build the output fragment with timestamp
                 var now = DateTime.Now;
                 string date = now.ToString("dd/MM/yyyy");
                 string time = now.ToString("HH:mm");
@@ -604,11 +820,9 @@ public class NetworkMonitorEngine
                     Interlocked.Increment(ref _uiState.NewThisSession);
                     Interlocked.Increment(ref _uiState.FoundThisRound);
                     await _alertChannel.Writer.WriteAsync(outputLine, token);
-                    // No longer appending to file here; full file is rewritten on debounced save.
                 }
                 else
                 {
-                    // Update timestamp for already‑known endpoint
                     _responsiveServers[endpointId] = outputLine;
                 }
 
@@ -621,11 +835,14 @@ public class NetworkMonitorEngine
         try { File.Delete(_cfg.TempOutput); } catch { }
     }
 
-    // ──────────────── Progress Monitor (background) ────────────────
+    // ──────────────── Progress Monitor (background, now pause‑aware) ────────────────
     private async Task MonitorProgressLoopAsync(Process proc, CancellationToken token)
     {
         while (!token.IsCancellationRequested && !proc.HasExited)
         {
+            // Freeze progress updates when paused
+            _pauseManager.WaitIfPaused(token);
+
             double progress = _uiState.WorkingEndpoints > 0
                 ? (_uiState.TestedThisRound / (double)_uiState.WorkingEndpoints) * 100.0
                 : 0;
@@ -757,7 +974,6 @@ public class NetworkMonitorEngine
                 {
                     while (!token.IsCancellationRequested)
                     {
-                        // Drain log channel
                         while (_logChannel.Reader.TryRead(out var msg))
                         {
                             logs.Add($"[{DateTime.Now:HH:mm:ss}] {msg}");
@@ -803,7 +1019,7 @@ public class NetworkMonitorEngine
                         var targetBar = BuildBar(targetProgress, 24);
 
                         var checkedList = new List<IRenderable>();
-                        lock (_uiState.CheckedUrls)   // thread‑safe read for the dashboard
+                        lock (_uiState.CheckedUrls)
                         {
                             if (_uiState.CheckedUrls.Count > 0)
                             {
