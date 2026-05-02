@@ -127,12 +127,11 @@ var monitorCfg = new MonitorConfiguration
     HealthCheckTargets = (savedSettings?.HealthCheckTargets?.Length > 0
                           ? savedSettings.HealthCheckTargets
                           : activeTargets.ToArray()),
-    ParallelWorkers    = savedSettings?.ParallelWorkers    ?? 50,
-    RequestDelayMs     = savedSettings?.RequestDelayMs     ?? 7000,
+    ParallelWorkers    = savedSettings?.ParallelWorkers    ?? 150,
+    RequestDelayMs     = savedSettings?.RequestDelayMs     ?? 15000,
     GlobalTimeoutSec   = savedSettings?.GlobalTimeoutSec   ?? 500,
     EnableBeep         = savedSettings?.EnableBeep         ?? true,
     BeepDayStart       = savedSettings?.BeepDayStart       ?? 12,
-    BeepDayEnd         = savedSettings?.BeepDayEnd         ?? 23,
     LogVerbosityLevel  = savedSettings?.LogVerbosityLevel  ?? "Normal"
 };
 
@@ -146,28 +145,14 @@ monitorCfg.BlacklistFile       = Path.Combine(resultsDir, "blacklist.txt");
 monitorCfg.NetworkToolPath     = Path.Combine(AppContext.BaseDirectory, "xray-knife.exe");
 monitorCfg.ResultsDir          = resultsDir;
 
-// Display resolved paths
+// Display resolved paths (no interactive prompts)
 AnsiConsole.MarkupLine($"[yellow]Targets source:[/] {(loadedTargets.Count > 0 ? "targets.txt" : "built‑in defaults")}");
 AnsiConsole.MarkupLine($"[yellow]Endpoint list:[/] {monitorCfg.EndpointListFile}");
 AnsiConsole.MarkupLine($"[yellow]Report file:[/]   {monitorCfg.ReportFile}");
 AnsiConsole.MarkupLine($"[yellow]Network tool:[/]  {monitorCfg.NetworkToolPath}");
+AnsiConsole.MarkupLine($"[grey]Monitoring will start with {monitorCfg.ParallelWorkers} workers, {monitorCfg.RequestDelayMs}ms delay.[/]");
 
-// Interactive prompts with validation (show current values as defaults)
-monitorCfg.ParallelWorkers = AnsiConsole.Prompt(
-    new TextPrompt<int>("[green]Number of parallel workers (1-500)[/]:")
-        .DefaultValue(monitorCfg.ParallelWorkers)
-        .Validate(w => w > 0 && w <= 500
-            ? ValidationResult.Success()
-            : ValidationResult.Error("Enter 1-500")));
-
-monitorCfg.RequestDelayMs = AnsiConsole.Prompt(
-    new TextPrompt<int>("[green]Delay between health checks in ms (0-30000)[/]:")
-        .DefaultValue(monitorCfg.RequestDelayMs)
-        .Validate(d => d >= 0 && d <= 30000
-            ? ValidationResult.Success()
-            : ValidationResult.Error("Enter 0-30000")));
-
-// Start the monitor
+// Start the monitor (no user input required)
 var engine = new NetworkMonitorEngine(monitorCfg);
 await engine.RunAsync();
 
@@ -185,12 +170,11 @@ public class MonitorConfiguration
     public string   BlacklistFile       { get; set; } = "blacklist.txt";
     public string   ResultsDir          { get; set; } = "";
     public string[] HealthCheckTargets  { get; set; } = Array.Empty<string>();
-    public int      ParallelWorkers     { get; set; } = 50;
-    public int      RequestDelayMs      { get; set; } = 7000;
+    public int      ParallelWorkers     { get; set; } = 150;
+    public int      RequestDelayMs      { get; set; } = 15000;
     public int      GlobalTimeoutSec    { get; set; } = 500;
     public bool     EnableBeep          { get; set; } = true;
     public int      BeepDayStart        { get; set; } = 12;
-    public int      BeepDayEnd          { get; set; } = 23;
     public string   LogVerbosityLevel   { get; set; } = "Normal";
 }
 
@@ -198,12 +182,11 @@ public class MonitorConfiguration
 public class MonitorSettingsDto
 {
     public string[] HealthCheckTargets  { get; set; } = Array.Empty<string>();
-    public int      ParallelWorkers     { get; set; } = 50;
-    public int      RequestDelayMs      { get; set; } = 7000;
+    public int      ParallelWorkers     { get; set; } = 150;
+    public int      RequestDelayMs      { get; set; } = 15000;
     public int      GlobalTimeoutSec    { get; set; } = 500;
     public bool     EnableBeep          { get; set; } = true;
     public int      BeepDayStart        { get; set; } = 12;
-    public int      BeepDayEnd          { get; set; } = 23;
     public string   LogVerbosityLevel   { get; set; } = "Normal";
 }
 
@@ -300,7 +283,6 @@ public class NetworkMonitorEngine
                 }
 
                 _uiState.ScanPhase = "Scanning";
-                // Fix: thread‑safe clear of checked URLs
                 lock (_uiState.CheckedUrls)
                 {
                     _uiState.CheckedUrls.Clear();
@@ -391,7 +373,6 @@ public class NetworkMonitorEngine
                 }
                 else if (key.Key == ConsoleKey.S)
                 {
-                    // Trigger settings menu (the call itself is blocking until menu closes)
                     await RunSettingsMenuAsync(token);
                 }
             }
@@ -402,15 +383,12 @@ public class NetworkMonitorEngine
     // ──────────────── Settings Menu ────────────────
     private async Task RunSettingsMenuAsync(CancellationToken mainToken)
     {
-        // 1. Record original pause state and pause if not already
         bool wasPaused = _pauseManager.IsPaused;
         if (!wasPaused)
             _pauseManager.Pause();
 
-        // 2. Clone current configuration for "revert" option
         MonitorConfiguration originalCfg = CloneConfiguration(_cfg);
 
-        // 3. Stop live dashboard (properly dispose old CTS)
         var oldDashboardCts = _dashboardCts;
         oldDashboardCts?.Cancel();
         if (_dashboardTask != null)
@@ -419,11 +397,10 @@ public class NetworkMonitorEngine
         }
         oldDashboardCts?.Dispose();
 
-        // 4. Show the settings menu
         try
         {
-            AnsiConsole.Clear();   // Fix: Use Spectre.Console's clear
-            var editCfg = CloneConfiguration(_cfg); // we'll modify this copy
+            AnsiConsole.Clear();
+            var editCfg = CloneConfiguration(_cfg);
             bool saved = false;
             bool discard = false;
 
@@ -439,8 +416,8 @@ public class NetworkMonitorEngine
                             $"⏰ Global Timeout sec      : [yellow]{editCfg.GlobalTimeoutSec}[/]",
                             $"🔔 Beep Notifications      : [yellow]{(editCfg.EnableBeep ? "ON" : "OFF")}[/]",
                             $"🌅 Beep Start Hour (0-23)  : [yellow]{editCfg.BeepDayStart}[/]",
-                            $"🌙 Beep End Hour (0-23)    : [yellow]{editCfg.BeepDayEnd}[/]",
                             $"📝 Log Verbosity           : [yellow]{editCfg.LogVerbosityLevel}[/]",
+                            $"📋 Manage Test Targets     : [yellow]({editCfg.HealthCheckTargets.Length} URLs)[/]",
                             "",
                             "[green]💾 Save & Exit[/]",
                             "[yellow]🔄 Restore Defaults[/]",
@@ -486,13 +463,6 @@ public class NetworkMonitorEngine
                                 .Validate(h => h >= 0 && h <= 23 ? ValidationResult.Success() : ValidationResult.Error("0-23")));
                         break;
 
-                    case string s when s.StartsWith("🌙"):
-                        editCfg.BeepDayEnd = AnsiConsole.Prompt(
-                            new TextPrompt<int>("[cyan]Beep End Hour (0-23)[/]:")
-                                .DefaultValue(editCfg.BeepDayEnd)
-                                .Validate(h => h >= 0 && h <= 23 ? ValidationResult.Success() : ValidationResult.Error("0-23")));
-                        break;
-
                     case string s when s.StartsWith("📝"):
                         editCfg.LogVerbosityLevel = AnsiConsole.Prompt(
                             new SelectionPrompt<string>()
@@ -500,8 +470,11 @@ public class NetworkMonitorEngine
                                 .AddChoices("Minimal", "Normal", "Verbose"));
                         break;
 
+                    case string s when s.StartsWith("📋"):
+                        await ManageTargetsAsync(editCfg);
+                        break;
+
                     case string s when s.Contains("Save"):
-                        // Apply changes to the running config
                         ApplyConfiguration(editCfg, _cfg);
                         await SaveSettingsToFileAsync(_cfg);
                         AnsiConsole.MarkupLine("[green]✅ Settings saved successfully![/]");
@@ -511,7 +484,6 @@ public class NetworkMonitorEngine
                     case string s when s.Contains("Restore"):
                         if (AnsiConsole.Confirm("[yellow]Reset all settings to defaults?[/]", false))
                         {
-                            // Reset to hard-coded defaults
                             var defaults = CreateDefaultConfiguration();
                             ApplyConfiguration(defaults, editCfg);
                             ApplyConfiguration(defaults, _cfg);
@@ -524,7 +496,6 @@ public class NetworkMonitorEngine
                     case string s when s.Contains("Exit"):
                         if (AnsiConsole.Confirm("[yellow]Discard all changes?[/]", false))
                         {
-                            // Discard changes: revert to original
                             ApplyConfiguration(originalCfg, _cfg);
                             AnsiConsole.MarkupLine("[yellow]✓ Changes discarded. Settings unchanged.[/]");
                             discard = true;
@@ -536,14 +507,100 @@ public class NetworkMonitorEngine
         }
         finally
         {
-            // 5. Restart dashboard with a fresh CTS (old one already disposed)
             _dashboardCts = new CancellationTokenSource();
             _dashboardTask = RunDashboardAsync(_dashboardCts.Token);
 
-            // 6. Restore pause state (unless it was already paused)
             if (!wasPaused)
                 _pauseManager.Resume();
         }
+    }
+
+    // ──────────────── Target URL management ────────────────
+    private async Task ManageTargetsAsync(MonitorConfiguration editCfg)
+    {
+        var targets = new List<string>(editCfg.HealthCheckTargets);
+        bool goBack = false;
+
+        while (!goBack)
+        {
+            AnsiConsole.Clear();
+            var header = new Rule("[bold cyan]MANAGE TEST TARGETS[/]");
+            AnsiConsole.Write(header);
+
+            if (targets.Count == 0)
+            {
+                AnsiConsole.MarkupLine("[yellow]No targets defined.[/]");
+            }
+            else
+            {
+                var table = new Table().Border(TableBorder.Rounded);
+                table.AddColumn(new TableColumn("[bold]#[/]").Centered());
+                table.AddColumn(new TableColumn("[bold]URL[/]"));
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    table.AddRow((i + 1).ToString(), targets[i]);
+                }
+                AnsiConsole.Write(table);
+            }
+
+            var action = AnsiConsole.Prompt(
+                new SelectionPrompt<string>()
+                    .Title("[bold]Choose action:[/]")
+                    .AddChoices("➕ Add a new URL", "➖ Remove a URL", "🗑  Remove all", "↩ Back to settings"));
+
+            switch (action)
+            {
+                case "➕ Add a new URL":
+                    var newUrl = AnsiConsole.Ask<string>("[green]Enter URL (must start with http):[/]").Trim();
+                    if (string.IsNullOrWhiteSpace(newUrl) || !newUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                    {
+                        AnsiConsole.MarkupLine("[red]Invalid URL. It must start with http.[/]");
+                        await Task.Delay(1000);
+                    }
+                    else
+                    {
+                        targets.Add(newUrl);
+                        AnsiConsole.MarkupLine("[green]✓ URL added.[/]");
+                        await Task.Delay(500);
+                    }
+                    break;
+
+                case "➖ Remove a URL":
+                    if (targets.Count == 0)
+                    {
+                        AnsiConsole.MarkupLine("[yellow]No URLs to remove.[/]");
+                        await Task.Delay(500);
+                        break;
+                    }
+                    var selected = AnsiConsole.Prompt(
+                        new SelectionPrompt<string>()
+                            .Title("[red]Select URL to remove:[/]")
+                            .AddChoices(targets));
+                    targets.Remove(selected);
+                    AnsiConsole.MarkupLine("[green]✓ URL removed.[/]");
+                    await Task.Delay(500);
+                    break;
+
+                case "🗑  Remove all":
+                    if (targets.Count > 0 && AnsiConsole.Confirm("[red]Delete all targets?[/]", false))
+                    {
+                        targets.Clear();
+                        AnsiConsole.MarkupLine("[yellow]All targets removed.[/]");
+                        await Task.Delay(500);
+                    }
+                    break;
+
+                case "↩ Back to settings":
+                    goBack = true;
+                    break;
+            }
+        }
+
+        // Apply back to the temporary config
+        editCfg.HealthCheckTargets = targets.ToArray();
+        // Show summary
+        AnsiConsole.MarkupLine($"[green]✓ Target list now contains {targets.Count} URL(s).[/]");
+        await Task.Delay(1000);
     }
 
     // ──────────────── Configuration helpers ────────────────
@@ -555,10 +612,8 @@ public class NetworkMonitorEngine
             GlobalTimeoutSec   = source.GlobalTimeoutSec,
             EnableBeep         = source.EnableBeep,
             BeepDayStart       = source.BeepDayStart,
-            BeepDayEnd         = source.BeepDayEnd,
             LogVerbosityLevel  = source.LogVerbosityLevel,
             HealthCheckTargets = source.HealthCheckTargets.ToArray(),
-            // The following are not user‑editable, just copy references
             EndpointListFile   = source.EndpointListFile,
             ReportFile         = source.ReportFile,
             NetworkToolPath    = source.NetworkToolPath,
@@ -576,7 +631,6 @@ public class NetworkMonitorEngine
         to.GlobalTimeoutSec   = from.GlobalTimeoutSec;
         to.EnableBeep         = from.EnableBeep;
         to.BeepDayStart       = from.BeepDayStart;
-        to.BeepDayEnd         = from.BeepDayEnd;
         to.LogVerbosityLevel  = from.LogVerbosityLevel;
         to.HealthCheckTargets = from.HealthCheckTargets.ToArray();
     }
@@ -584,12 +638,11 @@ public class NetworkMonitorEngine
     private static MonitorConfiguration CreateDefaultConfiguration() =>
         new()
         {
-            ParallelWorkers    = 50,
-            RequestDelayMs     = 7000,
+            ParallelWorkers    = 150,
+            RequestDelayMs     = 15000,
             GlobalTimeoutSec   = 500,
             EnableBeep         = true,
             BeepDayStart       = 12,
-            BeepDayEnd         = 23,
             LogVerbosityLevel  = "Normal",
             HealthCheckTargets = new[]
             {
@@ -618,7 +671,6 @@ public class NetworkMonitorEngine
                 GlobalTimeoutSec   = cfg.GlobalTimeoutSec,
                 EnableBeep         = cfg.EnableBeep,
                 BeepDayStart       = cfg.BeepDayStart,
-                BeepDayEnd         = cfg.BeepDayEnd,
                 LogVerbosityLevel  = cfg.LogVerbosityLevel
             };
             string path = Path.Combine(cfg.ResultsDir, "network_monitor_config.json");
@@ -676,16 +728,14 @@ public class NetworkMonitorEngine
 
         if (level == "Normal")
         {
-            // Normal: errors, cycle completions, warnings, blacklist loads, dedup summaries,
-            // pause/resume actions, new responsive endpoint alerts, timeouts
             return containsError
                 || cycleCompleted
                 || message.Contains("⚠")
-                || message.Contains("🚫 Loaded")   // blacklist load
-                || message.Contains("📄")          // dedup summary
-                || message.Contains("⏸") || message.Contains("⏯")  // pause/resume
+                || message.Contains("🚫 Loaded")
+                || message.Contains("📄")
+                || message.Contains("⏸") || message.Contains("⏯")
                 || message.Contains("✅ Responsive endpoint")
-                || message.Contains("⏱");         // timeout
+                || message.Contains("⏱");
         }
 
         // Minimal: only errors and cycle completions
@@ -776,7 +826,6 @@ public class NetworkMonitorEngine
         _uiState.ScanPhase = "Launching";
         await LogAsync($"▶ Launching check: {Truncate(targetUrl, 50)}", token);
 
-        // Use volatile read for cross‑thread safety
         int workingEndpoints = Volatile.Read(ref _uiState.WorkingEndpoints);
         double estimatedSeconds = 0;
         if (workingEndpoints > 0 && _cfg.ParallelWorkers > 0)
@@ -888,7 +937,8 @@ public class NetworkMonitorEngine
                 var now = DateTime.Now;
                 string date = now.ToString("dd/MM/yyyy");
                 string time = now.ToString("HH:mm");
-                string fragment = $"{date}  **NetDiagnostic**  {time}";
+                // Fragment tag: MIZI
+                string fragment = $"{date}  **MIZI**  {time}";
                 string outputLine = $"{endpointId}#{Uri.EscapeDataString(fragment)}";
 
                 if (_responsiveServers.TryAdd(endpointId, outputLine))
@@ -916,7 +966,6 @@ public class NetworkMonitorEngine
     {
         while (!token.IsCancellationRequested && !proc.HasExited)
         {
-            // Freeze progress updates when paused
             _pauseManager.WaitIfPaused(token);
 
             int working = Volatile.Read(ref _uiState.WorkingEndpoints);
@@ -983,21 +1032,22 @@ public class NetworkMonitorEngine
         catch (OperationCanceledException) { }
     }
 
+    // ──────────────── Beep (high pitch from start hour, low otherwise) ────────────────
     private void BeepAlert()
     {
         if (!_cfg.EnableBeep || !OperatingSystem.IsWindows()) return;
         var hour = DateTime.Now.Hour;
         try
         {
-            if (hour >= _cfg.BeepDayStart && hour < _cfg.BeepDayEnd)
+            if (hour >= _cfg.BeepDayStart)   // high beep from start hour to midnight
                 for (int i = 0; i < 5; i++) { Console.Beep(4500, 100); Thread.Sleep(40); }
-            else
+            else                              // low beep from midnight to start hour
                 Console.Beep(800, 250);
         }
         catch { }
     }
 
-    // ──────────────── Fragment Parsing ────────────────
+    // ──────────────── Fragment Parsing (MIZI tag) ────────────────
     private (string link, string name) SplitFragment(string raw)
     {
         raw = raw.Trim();
@@ -1012,15 +1062,16 @@ public class NetworkMonitorEngine
         return (link, name);
     }
 
-    // ──────────────── Sorting Helpers ────────────────
+    // ──────────────── Sorting Helper (MIZI fragment) ────────────────
     private static DateTime ExtractTimestamp(string fullLine)
     {
         var idx = fullLine.IndexOf('#');
         if (idx < 0) return DateTime.MinValue;
         var fragment = Uri.UnescapeDataString(fullLine[(idx + 1)..]);
 
+        // Fixed regex: \d{4} instead of \d\4}
         var match = Regex.Match(fragment,
-            @"^(\d{2}/\d{2}/\d{4})\s+\*\*NetDiagnostic\*\*\s+(\d{2}:\d{2})$");
+            @"^(\d{2}/\d{2}/\d{4})\s+\*\*MIZI\*\*\s+(\d{2}:\d{2})$");
         if (match.Success)
         {
             if (DateTime.TryParseExact($"{match.Groups[1].Value} {match.Groups[2].Value}",
@@ -1239,10 +1290,6 @@ public class PauseManager
 // ═══════════════ PATH HELPER ═══════════════
 public static class PathHelper
 {
-    /// <summary>
-    /// Searches for a folder named RESULTS starting from the application's base directory
-    /// and moving up to the drive root.
-    /// </summary>
     public static string? FindResultsFolder()
     {
         var current = AppContext.BaseDirectory;
