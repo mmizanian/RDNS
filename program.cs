@@ -300,7 +300,11 @@ public class NetworkMonitorEngine
                 }
 
                 _uiState.ScanPhase = "Scanning";
-                _uiState.CheckedUrls.Clear();
+                // Fix: thread‑safe clear of checked URLs
+                lock (_uiState.CheckedUrls)
+                {
+                    _uiState.CheckedUrls.Clear();
+                }
 
                 // Check each health‑check target against all endpoints
                 for (int i = 0; i < _cfg.HealthCheckTargets.Length; i++)
@@ -406,17 +410,19 @@ public class NetworkMonitorEngine
         // 2. Clone current configuration for "revert" option
         MonitorConfiguration originalCfg = CloneConfiguration(_cfg);
 
-        // 3. Stop live dashboard
-        _dashboardCts?.Cancel();
+        // 3. Stop live dashboard (properly dispose old CTS)
+        var oldDashboardCts = _dashboardCts;
+        oldDashboardCts?.Cancel();
         if (_dashboardTask != null)
         {
             try { await _dashboardTask; } catch (OperationCanceledException) { }
         }
+        oldDashboardCts?.Dispose();
 
         // 4. Show the settings menu
         try
         {
-            Console.Clear();
+            AnsiConsole.Clear();   // Fix: Use Spectre.Console's clear
             var editCfg = CloneConfiguration(_cfg); // we'll modify this copy
             bool saved = false;
             bool discard = false;
@@ -530,7 +536,7 @@ public class NetworkMonitorEngine
         }
         finally
         {
-            // 5. Restart dashboard
+            // 5. Restart dashboard with a fresh CTS (old one already disposed)
             _dashboardCts = new CancellationTokenSource();
             _dashboardTask = RunDashboardAsync(_dashboardCts.Token);
 
@@ -647,9 +653,44 @@ public class NetworkMonitorEngine
         }
     }
 
-    // ──────────────── Logging ────────────────
+    // ──────────────── Logging with verbosity filter ────────────────
     private async Task LogAsync(string message, CancellationToken token = default)
-        => await _logChannel.Writer.WriteAsync(message, token);
+    {
+        if (!ShouldLogMessage(message))
+            return;
+        await _logChannel.Writer.WriteAsync(message, token);
+    }
+
+    /// <summary>Determines if a message should be logged based on current verbosity.</summary>
+    private bool ShouldLogMessage(string message)
+    {
+        string level = _cfg.LogVerbosityLevel;
+        if (string.IsNullOrEmpty(level))
+            level = "Normal";
+
+        if (level == "Verbose")
+            return true;
+
+        bool containsError   = message.Contains("❌") || message.IndexOf("fatal", StringComparison.OrdinalIgnoreCase) >= 0;
+        bool cycleCompleted  = message.Contains("✅ Cycle completed");
+
+        if (level == "Normal")
+        {
+            // Normal: errors, cycle completions, warnings, blacklist loads, dedup summaries,
+            // pause/resume actions, new responsive endpoint alerts, timeouts
+            return containsError
+                || cycleCompleted
+                || message.Contains("⚠")
+                || message.Contains("🚫 Loaded")   // blacklist load
+                || message.Contains("📄")          // dedup summary
+                || message.Contains("⏸") || message.Contains("⏯")  // pause/resume
+                || message.Contains("✅ Responsive endpoint")
+                || message.Contains("⏱");         // timeout
+        }
+
+        // Minimal: only errors and cycle completions
+        return containsError || cycleCompleted;
+    }
 
     // ──────────────── Previous Reports ────────────────
     private async Task LoadPreviousReportsAsync()
@@ -735,9 +776,11 @@ public class NetworkMonitorEngine
         _uiState.ScanPhase = "Launching";
         await LogAsync($"▶ Launching check: {Truncate(targetUrl, 50)}", token);
 
+        // Use volatile read for cross‑thread safety
+        int workingEndpoints = Volatile.Read(ref _uiState.WorkingEndpoints);
         double estimatedSeconds = 0;
-        if (_uiState.WorkingEndpoints > 0 && _cfg.ParallelWorkers > 0)
-            estimatedSeconds = (_uiState.WorkingEndpoints / (double)_cfg.ParallelWorkers) *
+        if (workingEndpoints > 0 && _cfg.ParallelWorkers > 0)
+            estimatedSeconds = (workingEndpoints / (double)_cfg.ParallelWorkers) *
                                (_cfg.RequestDelayMs / 1000.0);
         int dynamicTimeoutSec = Math.Max(_cfg.GlobalTimeoutSec, (int)estimatedSeconds + 120);
 
@@ -876,8 +919,11 @@ public class NetworkMonitorEngine
             // Freeze progress updates when paused
             _pauseManager.WaitIfPaused(token);
 
-            double progress = _uiState.WorkingEndpoints > 0
-                ? (_uiState.TestedThisRound / (double)_uiState.WorkingEndpoints) * 100.0
+            int working = Volatile.Read(ref _uiState.WorkingEndpoints);
+            int tested  = Volatile.Read(ref _uiState.TestedThisRound);
+
+            double progress = working > 0
+                ? (tested / (double)working) * 100.0
                 : 0;
             double fallback = _cfg.GlobalTimeoutSec > 0
                 ? Math.Min(95, ((DateTime.Now - _uiState.ScanStartTime).TotalSeconds / _cfg.GlobalTimeoutSec) * 100.0)
