@@ -405,96 +405,157 @@ public class NetworkMonitorEngine
 
         try
         {
-            AnsiConsole.Clear();
-            var editCfg = CloneConfiguration(_cfg);
-            bool saved = false;
-            bool discard = false;
-
-            while (!saved && !discard && !mainToken.IsCancellationRequested)
+            bool exitMenu = false;
+            while (!exitMenu && !mainToken.IsCancellationRequested)
             {
-                var choice = AnsiConsole.Prompt(
+                AnsiConsole.Clear();
+                var header = new Rule("[bold cyan]⚙ NETWORK MONITOR SETTINGS[/]");
+                header.LeftJustified();
+                AnsiConsole.Write(header);
+
+                // Create a table for better layout
+                var table = new Table()
+                    .Border(TableBorder.Rounded)
+                    .BorderColor(Color.Cyan1)
+                    .Title("[bold yellow]Configuration Options[/]")
+                    .AddColumn(new TableColumn("[bold]Setting[/]").Centered())
+                    .AddColumn(new TableColumn("[bold]Current Value[/]").LeftAligned())
+                    .AddColumn(new TableColumn("[bold]Action[/]").Centered());
+
+                // Add rows for each setting
+                table.AddRow(
+                    "[cyan]📊 Parallel Workers[/]",
+                    $"[yellow]{_cfg.ParallelWorkers}[/] (1-500)",
+                    "[green]Modify[/]"
+                );
+                table.AddRow(
+                    "[cyan]⏱ Delay Between Checks[/]",
+                    $"[yellow]{_cfg.RequestDelayMs}ms[/] (0-30000)",
+                    "[green]Modify[/]"
+                );
+                table.AddRow(
+                    "[cyan]⏰ Global Timeout[/]",
+                    $"[yellow]{_cfg.GlobalTimeoutSec}s[/] (60-3600)",
+                    "[green]Modify[/]"
+                );
+                table.AddRow(
+                    "[cyan]🔔 Beep Notifications[/]",
+                    $"[yellow]{(_cfg.EnableBeep ? "ON" : "OFF")}[/]",
+                    "[green]Toggle[/]"
+                );
+                table.AddRow(
+                    "[cyan]🌅 Beep Start Hour[/]",
+                    $"[yellow]{_cfg.BeepDayStart}:00[/] (0-23)",
+                    "[green]Modify[/]"
+                );
+                table.AddRow(
+                    "[cyan]📝 Log Verbosity[/]",
+                    $"[yellow]{_cfg.LogVerbosityLevel}[/] (Minimal/Normal/Verbose)",
+                    "[green]Change[/]"
+                );
+                table.AddRow(
+                    "[cyan]🏷 Fragment Tag[/]",
+                    $"[yellow]{_cfg.FragmentTag}[/] (custom identifier)",
+                    "[green]Modify[/]"
+                );
+                table.AddRow(
+                    "[cyan]📁 Source Endpoints File[/]",
+                    $"[yellow]{(string.IsNullOrEmpty(_cfg.SourceEndpointsFile) ? "default" : Path.GetFileName(_cfg.SourceEndpointsFile))}[/]",
+                    "[green]Change[/]"
+                );
+                table.AddRow(
+                    "[cyan]📋 Test Targets[/]",
+                    $"[yellow]{_cfg.HealthCheckTargets.Length} URLs[/] configured",
+                    "[green]Manage[/]"
+                );
+
+                AnsiConsole.Write(table);
+
+                // Action menu
+                AnsiConsole.WriteLine();
+                var action = AnsiConsole.Prompt(
                     new SelectionPrompt<string>()
-                        .Title("[bold cyan]⚙ SETTINGS MENU[/]")
-                        .AddChoices(new[]
-                        {
-                            $"📊 Parallel Workers        : [yellow]{editCfg.ParallelWorkers}[/]",
-                            $"⏱  Delay Between Checks ms : [yellow]{editCfg.RequestDelayMs}[/]",
-                            $"⏰ Global Timeout sec      : [yellow]{editCfg.GlobalTimeoutSec}[/]",
-                            $"🔔 Beep Notifications      : [yellow]{(editCfg.EnableBeep ? "ON" : "OFF")}[/]",
-                            $"🌅 Beep Start Hour (0-23)  : [yellow]{editCfg.BeepDayStart}[/]",
-                            $"📝 Log Verbosity           : [yellow]{editCfg.LogVerbosityLevel}[/]",
-                            $"🏷  Fragment Tag           : [yellow]{editCfg.FragmentTag}[/]",
-                            $"📁 Source Endpoints File   : [yellow]{(string.IsNullOrEmpty(editCfg.SourceEndpointsFile) ? "default" : Path.GetFileName(editCfg.SourceEndpointsFile))}[/]",
-                            $"📋 Manage Test Targets     : [yellow]({editCfg.HealthCheckTargets.Length} URLs)[/]",
+                        .Title("[bold white]Choose an action:[/]")
+                        .PageSize(15)
+                        .AddChoices(
+                            "1. 📊 Modify Parallel Workers",
+                            "2. ⏱ Modify Delay Between Checks",
+                            "3. ⏰ Modify Global Timeout",
+                            "4. 🔔 Toggle Beep Notifications",
+                            "5. 🌅 Modify Beep Start Hour",
+                            "6. 📝 Change Log Verbosity",
+                            "7. 🏷 Modify Fragment Tag",
+                            "8. 📁 Change Source Endpoints File",
+                            "9. 📋 Manage Test Targets",
                             "",
                             "[green]💾 Save & Exit[/]",
                             "[yellow]🔄 Restore Defaults[/]",
                             "[red]❌ Exit Without Saving[/]"
-                        }));
+                        ));
 
-                if (string.IsNullOrWhiteSpace(choice))
+                if (string.IsNullOrWhiteSpace(action))
                     continue;
 
-                switch (choice)
+                switch (action)
                 {
-                    case string s when s.StartsWith("📊"):
-                        editCfg.ParallelWorkers = AnsiConsole.Prompt(
+                    case string s when s.Contains("1.") || s.Contains("📊"):
+                        _cfg.ParallelWorkers = AnsiConsole.Prompt(
                             new TextPrompt<int>("[cyan]Parallel Workers (1-500)[/]:")
-                                .DefaultValue(editCfg.ParallelWorkers)
-                                .Validate(w => w > 0 && w <= 500 ? ValidationResult.Success() : ValidationResult.Error("1-500")));
+                                .DefaultValue(_cfg.ParallelWorkers)
+                                .Validate(w => w > 0 && w <= 500 ? ValidationResult.Success() : ValidationResult.Error("Must be 1-500")));
                         break;
 
-                    case string s when s.StartsWith("⏱"):
-                        editCfg.RequestDelayMs = AnsiConsole.Prompt(
+                    case string s when s.Contains("2.") || s.Contains("⏱"):
+                        _cfg.RequestDelayMs = AnsiConsole.Prompt(
                             new TextPrompt<int>("[cyan]Delay Between Checks ms (0-30000)[/]:")
-                                .DefaultValue(editCfg.RequestDelayMs)
-                                .Validate(d => d >= 0 && d <= 30000 ? ValidationResult.Success() : ValidationResult.Error("0-30000")));
+                                .DefaultValue(_cfg.RequestDelayMs)
+                                .Validate(d => d >= 0 && d <= 30000 ? ValidationResult.Success() : ValidationResult.Error("Must be 0-30000")));
                         break;
 
-                    case string s when s.StartsWith("⏰"):
-                        editCfg.GlobalTimeoutSec = AnsiConsole.Prompt(
+                    case string s when s.Contains("3.") || s.Contains("⏰"):
+                        _cfg.GlobalTimeoutSec = AnsiConsole.Prompt(
                             new TextPrompt<int>("[cyan]Global Timeout sec (60-3600)[/]:")
-                                .DefaultValue(editCfg.GlobalTimeoutSec)
-                                .Validate(t => t >= 60 && t <= 3600 ? ValidationResult.Success() : ValidationResult.Error("60-3600")));
+                                .DefaultValue(_cfg.GlobalTimeoutSec)
+                                .Validate(t => t >= 60 && t <= 3600 ? ValidationResult.Success() : ValidationResult.Error("Must be 60-3600")));
                         break;
 
-                    case string s when s.StartsWith("🔔"):
-                        editCfg.EnableBeep = !editCfg.EnableBeep;
-                        AnsiConsole.MarkupLine($"[grey]✓ Beep toggled to {(editCfg.EnableBeep ? "[green]ON[/]" : "[red]OFF[/]")}[/]");
-                        await Task.Delay(500);
+                    case string s when s.Contains("4.") || s.Contains("🔔"):
+                        _cfg.EnableBeep = !_cfg.EnableBeep;
+                        AnsiConsole.MarkupLine($"[grey]✓ Beep notifications {( _cfg.EnableBeep ? "[green]ENABLED[/]" : "[red]DISABLED[/]")}[/]");
+                        await Task.Delay(800);
                         break;
 
-                    case string s when s.StartsWith("🌅"):
-                        editCfg.BeepDayStart = AnsiConsole.Prompt(
+                    case string s when s.Contains("5.") || s.Contains("🌅"):
+                        _cfg.BeepDayStart = AnsiConsole.Prompt(
                             new TextPrompt<int>("[cyan]Beep Start Hour (0-23)[/]:")
-                                .DefaultValue(editCfg.BeepDayStart)
-                                .Validate(h => h >= 0 && h <= 23 ? ValidationResult.Success() : ValidationResult.Error("0-23")));
+                                .DefaultValue(_cfg.BeepDayStart)
+                                .Validate(h => h >= 0 && h <= 23 ? ValidationResult.Success() : ValidationResult.Error("Must be 0-23")));
                         break;
 
-                    case string s when s.StartsWith("📝"):
-                        editCfg.LogVerbosityLevel = AnsiConsole.Prompt(
+                    case string s when s.Contains("6.") || s.Contains("📝"):
+                        _cfg.LogVerbosityLevel = AnsiConsole.Prompt(
                             new SelectionPrompt<string>()
                                 .Title("[cyan]Log Verbosity Level[/]")
                                 .AddChoices("Minimal", "Normal", "Verbose"));
                         break;
 
-                    case string s when s.StartsWith("🏷"):
-                        editCfg.FragmentTag = AnsiConsole.Prompt(
+                    case string s when s.Contains("7.") || s.Contains("🏷"):
+                        _cfg.FragmentTag = AnsiConsole.Prompt(
                             new TextPrompt<string>("[cyan]Fragment Tag (e.g., MIZI)[/]")
-                                .DefaultValue(editCfg.FragmentTag)
+                                .DefaultValue(_cfg.FragmentTag)
                                 .Validate(t => !string.IsNullOrWhiteSpace(t) ? ValidationResult.Success() : ValidationResult.Error("Tag cannot be empty")));
                         break;
 
-                    case string s when s.StartsWith("📁"):
+                    case string s when s.Contains("8.") || s.Contains("📁"):
                         var customSource = AnsiConsole.Ask<string>("[cyan]Source endpoints file (leave blank for default)[/]").Trim();
                         if (string.IsNullOrEmpty(customSource))
                         {
-                            editCfg.SourceEndpointsFile = "";
+                            _cfg.SourceEndpointsFile = "";
                             AnsiConsole.MarkupLine("[grey]✓ Using default source file[/]");
                         }
                         else if (File.Exists(customSource))
                         {
-                            editCfg.SourceEndpointsFile = customSource;
+                            _cfg.SourceEndpointsFile = customSource;
                             var lineCount = File.ReadAllLines(customSource).Length;
                             AnsiConsole.MarkupLine($"[green]✓ Using custom source ({lineCount} endpoints)[/]");
                         }
@@ -502,39 +563,36 @@ public class NetworkMonitorEngine
                         {
                             AnsiConsole.MarkupLine($"[red]✗ File not found: {customSource}[/]");
                         }
-                        await Task.Delay(500);
+                        await Task.Delay(1000);
                         break;
 
-                    case string s when s.StartsWith("📋"):
-                        await ManageTargetsAsync(editCfg);
+                    case string s when s.Contains("9.") || s.Contains("📋"):
+                        await ManageTargetsAsync(_cfg);
                         break;
 
                     case string s when s.Contains("Save"):
-                        ApplyConfiguration(editCfg, _cfg);
                         await SaveSettingsToFileAsync(_cfg);
                         AnsiConsole.MarkupLine("[green]✅ Settings saved successfully![/]");
-                        saved = true;
+                        exitMenu = true;
                         break;
 
                     case string s when s.Contains("Restore"):
-                        if (AnsiConsole.Confirm("[yellow]Reset all settings to defaults?[/]", false))
+                        if (AnsiConsole.Confirm("[yellow]Reset ALL settings to defaults?[/]", false))
                         {
                             var defaults = CreateDefaultConfiguration();
-                            ApplyConfiguration(defaults, editCfg);
                             ApplyConfiguration(defaults, _cfg);
                             try { File.Delete(Path.Combine(_cfg.ResultsDir, "network_monitor_config.json")); } catch { }
                             AnsiConsole.MarkupLine("[green]✅ All settings reset to defaults![/]");
-                            await Task.Delay(500);
+                            await Task.Delay(1000);
                         }
                         break;
 
                     case string s when s.Contains("Exit"):
-                        if (AnsiConsole.Confirm("[yellow]Discard all changes?[/]", false))
+                        if (AnsiConsole.Confirm("[yellow]Discard ALL changes?[/]", false))
                         {
                             ApplyConfiguration(originalCfg, _cfg);
-                            AnsiConsole.MarkupLine("[yellow]✓ Changes discarded. Settings unchanged.[/]");
-                            discard = true;
-                            await Task.Delay(500);
+                            AnsiConsole.MarkupLine("[yellow]✓ All changes discarded. Settings unchanged.[/]");
+                            exitMenu = true;
                         }
                         break;
                 }
@@ -544,26 +602,22 @@ public class NetworkMonitorEngine
         {
             // Cancel old dashboard
             try { _dashboardCts?.Cancel(); } catch { }
-            
-            // Properly wait for old dashboard to exit
+
+            // Properly wait for old dashboard to exit (async-friendly)
             if (_dashboardTask != null && !_dashboardTask.IsCompleted)
             {
-                try 
-                { 
-                    // Wait max 500ms for graceful exit
-                    if (!_dashboardTask.Wait(500))
-                    {
-                        // Dispose anyway if it didn't finish
-                    }
+                try
+                {
+                    await Task.WhenAny(_dashboardTask, Task.Delay(500));
                 }
                 catch { }
             }
-            
+
             try { _dashboardCts?.Dispose(); } catch { }
-            
+
             // Small delay to ensure clean teardown
-            Task.Delay(100).Wait();
-            
+            try { await Task.Delay(100); } catch { }
+
             // Create completely fresh dashboard
             _dashboardCts = new CancellationTokenSource();
             _dashboardTask = RunDashboardAsync(_dashboardCts.Token);
@@ -576,7 +630,7 @@ public class NetworkMonitorEngine
     // ──────────────── Target URL management ────────────────
     private async Task ManageTargetsAsync(MonitorConfiguration editCfg)
     {
-        var targets = new List<string>(editCfg.HealthCheckTargets);
+        var targets = new List<string>(_cfg.HealthCheckTargets);
         bool goBack = false;
 
         while (!goBack)
@@ -654,8 +708,8 @@ public class NetworkMonitorEngine
             }
         }
 
-        // Apply back to the temporary config
-        editCfg.HealthCheckTargets = targets.ToArray();
+        // Apply back to the config
+        _cfg.HealthCheckTargets = targets.ToArray();
         // Show summary
         AnsiConsole.MarkupLine($"[green]✓ Target list now contains {targets.Count} URL(s).[/]");
         await Task.Delay(1000);
@@ -809,9 +863,22 @@ public class NetworkMonitorEngine
     // ──────────────── Previous Reports ────────────────
     private async Task LoadPreviousReportsAsync()
     {
-        // Disabled: Don't load previous reports to avoid duplicates in output
-        // Each run should only show endpoints found in the current session
-        return;
+        if (!File.Exists(_cfg.ReportFile)) return;
+        var lines = await File.ReadAllLinesAsync(_cfg.ReportFile);
+        int loaded = 0;
+        foreach (var line in lines)
+        {
+            var (link, _) = SplitFragment(line);
+            if (string.IsNullOrEmpty(link)) continue;
+            // Only add if not already present (preserve existing timestamps)
+            if (!_responsiveServers.ContainsKey(link))
+            {
+                _responsiveServers[link] = line;
+                loaded++;
+            }
+        }
+        if (loaded > 0)
+            await LogAsync($"📂 Loaded {loaded} previous responsive endpoints");
     }
 
     // ──────────────── Endpoint List Refresh & Dedup ────────────────
