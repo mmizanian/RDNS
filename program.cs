@@ -144,6 +144,8 @@ monitorCfg.TempOutput          = Path.Combine(resultsDir, "scan_result.tmp");
 monitorCfg.BlacklistFile       = Path.Combine(resultsDir, "blacklist.txt");
 monitorCfg.NetworkToolPath     = Path.Combine(AppContext.BaseDirectory, "xray-knife.exe");
 monitorCfg.ResultsDir          = resultsDir;
+monitorCfg.FragmentTag         = savedSettings?.FragmentTag       ?? "MIZI";
+monitorCfg.SourceEndpointsFile = savedSettings?.SourceEndpointsFile ?? "";
 
 // Display resolved paths (no interactive prompts)
 AnsiConsole.MarkupLine($"[yellow]Targets source:[/] {(loadedTargets.Count > 0 ? "targets.txt" : "built‑in defaults")}");
@@ -176,6 +178,8 @@ public class MonitorConfiguration
     public bool     EnableBeep          { get; set; } = true;
     public int      BeepDayStart        { get; set; } = 12;
     public string   LogVerbosityLevel   { get; set; } = "Normal";
+    public string   FragmentTag         { get; set; } = "MIZI";  // Tag for response timestamp fragments
+    public string   SourceEndpointsFile { get; set; } = "";      // Alternative source file (if set, used instead of default)
 }
 
 /// <summary>Helper class for deserializing the external config file (user‑facing settings only).</summary>
@@ -188,6 +192,8 @@ public class MonitorSettingsDto
     public bool     EnableBeep          { get; set; } = true;
     public int      BeepDayStart        { get; set; } = 12;
     public string   LogVerbosityLevel   { get; set; } = "Normal";
+    public string   FragmentTag         { get; set; } = "MIZI";
+    public string   SourceEndpointsFile { get; set; } = "";
 }
 
 // ═══════════════════ ENGINE ═══════════════════
@@ -417,6 +423,8 @@ public class NetworkMonitorEngine
                             $"🔔 Beep Notifications      : [yellow]{(editCfg.EnableBeep ? "ON" : "OFF")}[/]",
                             $"🌅 Beep Start Hour (0-23)  : [yellow]{editCfg.BeepDayStart}[/]",
                             $"📝 Log Verbosity           : [yellow]{editCfg.LogVerbosityLevel}[/]",
+                            $"🏷  Fragment Tag           : [yellow]{editCfg.FragmentTag}[/]",
+                            $"📁 Source Endpoints File   : [yellow]{(string.IsNullOrEmpty(editCfg.SourceEndpointsFile) ? "default" : Path.GetFileName(editCfg.SourceEndpointsFile))}[/]",
                             $"📋 Manage Test Targets     : [yellow]({editCfg.HealthCheckTargets.Length} URLs)[/]",
                             "",
                             "[green]💾 Save & Exit[/]",
@@ -470,6 +478,33 @@ public class NetworkMonitorEngine
                                 .AddChoices("Minimal", "Normal", "Verbose"));
                         break;
 
+                    case string s when s.StartsWith("🏷"):
+                        editCfg.FragmentTag = AnsiConsole.Prompt(
+                            new TextPrompt<string>("[cyan]Fragment Tag (e.g., MIZI)[/]")
+                                .DefaultValue(editCfg.FragmentTag)
+                                .Validate(t => !string.IsNullOrWhiteSpace(t) ? ValidationResult.Success() : ValidationResult.Error("Tag cannot be empty")));
+                        break;
+
+                    case string s when s.StartsWith("📁"):
+                        var customSource = AnsiConsole.Ask<string>("[cyan]Source endpoints file (leave blank for default)[/]").Trim();
+                        if (string.IsNullOrEmpty(customSource))
+                        {
+                            editCfg.SourceEndpointsFile = "";
+                            AnsiConsole.MarkupLine("[grey]✓ Using default source file[/]");
+                        }
+                        else if (File.Exists(customSource))
+                        {
+                            editCfg.SourceEndpointsFile = customSource;
+                            var lineCount = File.ReadAllLines(customSource).Length;
+                            AnsiConsole.MarkupLine($"[green]✓ Using custom source ({lineCount} endpoints)[/]");
+                        }
+                        else
+                        {
+                            AnsiConsole.MarkupLine($"[red]✗ File not found: {customSource}[/]");
+                        }
+                        await Task.Delay(500);
+                        break;
+
                     case string s when s.StartsWith("📋"):
                         await ManageTargetsAsync(editCfg);
                         break;
@@ -507,6 +542,29 @@ public class NetworkMonitorEngine
         }
         finally
         {
+            // Cancel old dashboard
+            try { _dashboardCts?.Cancel(); } catch { }
+            
+            // Properly wait for old dashboard to exit
+            if (_dashboardTask != null && !_dashboardTask.IsCompleted)
+            {
+                try 
+                { 
+                    // Wait max 500ms for graceful exit
+                    if (!_dashboardTask.Wait(500))
+                    {
+                        // Dispose anyway if it didn't finish
+                    }
+                }
+                catch { }
+            }
+            
+            try { _dashboardCts?.Dispose(); } catch { }
+            
+            // Small delay to ensure clean teardown
+            Task.Delay(100).Wait();
+            
+            // Create completely fresh dashboard
             _dashboardCts = new CancellationTokenSource();
             _dashboardTask = RunDashboardAsync(_dashboardCts.Token);
 
@@ -613,6 +671,8 @@ public class NetworkMonitorEngine
             EnableBeep         = source.EnableBeep,
             BeepDayStart       = source.BeepDayStart,
             LogVerbosityLevel  = source.LogVerbosityLevel,
+            FragmentTag        = source.FragmentTag,
+            SourceEndpointsFile = source.SourceEndpointsFile,
             HealthCheckTargets = source.HealthCheckTargets.ToArray(),
             EndpointListFile   = source.EndpointListFile,
             ReportFile         = source.ReportFile,
@@ -632,6 +692,8 @@ public class NetworkMonitorEngine
         to.EnableBeep         = from.EnableBeep;
         to.BeepDayStart       = from.BeepDayStart;
         to.LogVerbosityLevel  = from.LogVerbosityLevel;
+        to.FragmentTag        = from.FragmentTag;
+        to.SourceEndpointsFile = from.SourceEndpointsFile;
         to.HealthCheckTargets = from.HealthCheckTargets.ToArray();
     }
 
@@ -644,6 +706,8 @@ public class NetworkMonitorEngine
             EnableBeep         = true,
             BeepDayStart       = 12,
             LogVerbosityLevel  = "Normal",
+            FragmentTag        = "MIZI",
+            SourceEndpointsFile = "",
             HealthCheckTargets = new[]
             {
                 "https://www.wikipedia.org/robots.txt",
@@ -671,7 +735,9 @@ public class NetworkMonitorEngine
                 GlobalTimeoutSec   = cfg.GlobalTimeoutSec,
                 EnableBeep         = cfg.EnableBeep,
                 BeepDayStart       = cfg.BeepDayStart,
-                LogVerbosityLevel  = cfg.LogVerbosityLevel
+                LogVerbosityLevel  = cfg.LogVerbosityLevel,
+                FragmentTag        = cfg.FragmentTag,
+                SourceEndpointsFile = cfg.SourceEndpointsFile
             };
             string path = Path.Combine(cfg.ResultsDir, "network_monitor_config.json");
             string json = JsonSerializer.Serialize(dto, new JsonSerializerOptions { WriteIndented = true });
@@ -723,19 +789,17 @@ public class NetworkMonitorEngine
         if (level == "Verbose")
             return true;
 
-        bool containsError   = message.Contains("❌") || message.IndexOf("fatal", StringComparison.OrdinalIgnoreCase) >= 0;
-        bool cycleCompleted  = message.Contains("✅ Cycle completed");
+        bool containsError      = message.Contains("❌") || message.IndexOf("fatal", StringComparison.OrdinalIgnoreCase) >= 0;
+        bool cycleCompleted     = message.Contains("✅ Cycle completed");
+        bool isAlert            = message.Contains("✅ Responsive endpoint");  // Always show new discoveries
+        bool isWarning          = message.Contains("⚠") || message.Contains("Timeout");
+        bool isBlacklist        = message.Contains("🚫 Loaded");
+        bool isDedup            = message.Contains("📄");  // User needs to know about deduplication
 
         if (level == "Normal")
         {
-            return containsError
-                || cycleCompleted
-                || message.Contains("⚠")
-                || message.Contains("🚫 Loaded")
-                || message.Contains("📄")
-                || message.Contains("⏸") || message.Contains("⏯")
-                || message.Contains("✅ Responsive endpoint")
-                || message.Contains("⏱");
+            // Normal: Show key events - discoveries, errors, warnings, dedup info
+            return containsError || cycleCompleted || isAlert || isWarning || isBlacklist || isDedup;
         }
 
         // Minimal: only errors and cycle completions
@@ -745,29 +809,25 @@ public class NetworkMonitorEngine
     // ──────────────── Previous Reports ────────────────
     private async Task LoadPreviousReportsAsync()
     {
-        if (!File.Exists(_cfg.ReportFile)) return;
-        var lines = await File.ReadAllLinesAsync(_cfg.ReportFile);
-        int loaded = 0;
-        foreach (var line in lines)
-        {
-            var (link, _) = SplitFragment(line);
-            if (string.IsNullOrEmpty(link)) continue;
-            _responsiveServers[link] = line;
-            loaded++;
-        }
-        if (loaded > 0)
-            await LogAsync($"📂 Loaded {loaded} previous responsive endpoints");
+        // Disabled: Don't load previous reports to avoid duplicates in output
+        // Each run should only show endpoints found in the current session
+        return;
     }
 
     // ──────────────── Endpoint List Refresh & Dedup ────────────────
     private async Task<int> RefreshEndpointListAsync(CancellationToken token)
     {
-        if (!File.Exists(_cfg.EndpointListFile)) return 0;
+        // Use custom source file if configured, otherwise use default
+        string sourceFile = !string.IsNullOrEmpty(_cfg.SourceEndpointsFile) && File.Exists(_cfg.SourceEndpointsFile)
+            ? _cfg.SourceEndpointsFile
+            : _cfg.EndpointListFile;
+
+        if (!File.Exists(sourceFile)) return 0;
 
         string[] sourceLines = Array.Empty<string>();
         for (int retry = 0; retry < 3; retry++)
         {
-            try { sourceLines = await File.ReadAllLinesAsync(_cfg.EndpointListFile, token); break; }
+            try { sourceLines = await File.ReadAllLinesAsync(sourceFile, token); break; }
             catch (IOException) { await Task.Delay(1000, token); }
         }
         if (sourceLines.Length == 0)
@@ -937,8 +997,8 @@ public class NetworkMonitorEngine
                 var now = DateTime.Now;
                 string date = now.ToString("dd/MM/yyyy");
                 string time = now.ToString("HH:mm");
-                // Fragment tag: MIZI
-                string fragment = $"{date}  **MIZI**  {time}";
+                // Fragment tag: configurable (default MIZI)
+                string fragment = $"{date}  **{_cfg.FragmentTag}**  {time}";
                 string outputLine = $"{endpointId}#{Uri.EscapeDataString(fragment)}";
 
                 if (_responsiveServers.TryAdd(endpointId, outputLine))
@@ -1025,7 +1085,8 @@ public class NetworkMonitorEngine
             await foreach (var line in _alertChannel.Reader.ReadAllAsync(token))
             {
                 var (_, name) = SplitFragment(line);
-                await LogAsync($"✅ Responsive endpoint: {Truncate(name, 24)}", token);
+                // Always log alerts (bypass verbosity filter) - these are important discoveries
+                await _logChannel.Writer.WriteAsync($"✅ Responsive endpoint: {Truncate(name, 24)}", token);
                 BeepAlert();
             }
         }
@@ -1069,9 +1130,9 @@ public class NetworkMonitorEngine
         if (idx < 0) return DateTime.MinValue;
         var fragment = Uri.UnescapeDataString(fullLine[(idx + 1)..]);
 
-        // Fixed regex: \d{4} instead of \d\4}
+        // Match any tag between ** ** with date and time
         var match = Regex.Match(fragment,
-            @"^(\d{2}/\d{2}/\d{4})\s+\*\*MIZI\*\*\s+(\d{2}:\d{2})$");
+            @"^(\d{2}/\d{2}/\d{4})\s+\*\*.*?\*\*\s+(\d{2}:\d{2})$");
         if (match.Success)
         {
             if (DateTime.TryParseExact($"{match.Groups[1].Value} {match.Groups[2].Value}",
@@ -1102,6 +1163,12 @@ public class NetworkMonitorEngine
                 .Overflow(VerticalOverflow.Ellipsis)
                 .StartAsync(async ctx =>
                 {
+                    // Catch up with any logs written while dashboard was off
+                    while (_logChannel.Reader.TryRead(out var msg))
+                    {
+                        logs.Add($"[{DateTime.Now:HH:mm:ss}] {msg}");
+                        if (logs.Count > MaxLogLines) logs.RemoveAt(0);
+                    }
                     while (!token.IsCancellationRequested)
                     {
                         while (_logChannel.Reader.TryRead(out var msg))
@@ -1217,6 +1284,11 @@ public class NetworkMonitorEngine
                 });
         }
         catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            // Log dashboard failures to prevent silent crashes
+            try { await LogAsync($"⚠ Dashboard UI error (recovered): {ex.GetType().Name}", token); } catch { }
+        }
     }
 
     private static Markup ColorizeLogLine(string line)
