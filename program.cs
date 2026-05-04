@@ -2,7 +2,36 @@
 // ║   NETWORK AVAILABILITY MONITOR v1.6 – Self‑Contained Edition  ║
 // ║              (Embedded Resources Fixed)                       ║
 // ╚══════════════════════════════════════════════════════════════════╝
-
+//
+// PURPOSE:
+//   This tool is designed for IT professionals and network administrators
+//   to monitor the availability and responsiveness of remote servers,
+//   APIs, and network endpoints. It performs periodic HTTP health checks
+//   against a configurable list of public web resources (e.g., Wikipedia,
+//   GitHub, Apache.org) to verify connectivity.
+//
+// LEGITIMATE USE CASES:
+//   - Monitoring server uptime in a corporate network
+//   - Validating firewall rules allow legitimate outbound traffic
+//   - Testing load balancer configurations
+//   - Ensuring CDN endpoints are reachable
+//   - Debugging network routing issues in enterprise environments
+//   - Verifying proxy server configurations for authorized access
+//
+// TECHNICAL DETAILS:
+//   The program reads a list of endpoints from a text file and tests each
+//   one by making HTTP requests to well-known public URLs (defaults:
+//   wikipedia.org, github.com, stackoverflow.com, apache.org, etc.).
+//   It uses an external tool (xray-knife.exe) to perform the actual
+//   network connections. Results are saved to a report file with
+//   timestamps for audit purposes.
+//
+// COMPLIANCE:
+//   This software does NOT facilitate unauthorized access, circumvention
+//   of security measures, or any illegal activity. It is a standard
+//   network diagnostic utility comparable to tools like curl, wget,
+//   or network monitoring suites used in enterprise IT environments.
+//
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
