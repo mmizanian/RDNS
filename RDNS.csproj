@@ -3,12 +3,24 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>RDNS</RootNamespace>
+    <AssemblyName>RDNS</AssemblyName>
+    <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Spectre.Console" Version="0.55.2" />
+    <PackageReference Include="Spectre.Console" Version="0.49.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\servers_to_check.txt" />
+    <EmbeddedResource Include="Resources\targets.txt" />
+    <EmbeddedResource Include="Resources\blacklist.txt" />
+    <EmbeddedResource Include="Resources\xray-knife.exe" />
   </ItemGroup>
 
 </Project>

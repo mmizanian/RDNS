@@ -1,40 +1,7 @@
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║              NETWORK AVAILABILITY MONITOR v1.0                 ║
-// ║              Professional Network Diagnostic Tool              ║
-// ║        NETWORK AVAILABILITY MONITOR v1.5 (Stable Menu)        ║
+// ║   NETWORK AVAILABILITY MONITOR v1.6 – Self‑Contained Edition  ║
+// ║              (Embedded Resources Fixed)                       ║
 // ╚══════════════════════════════════════════════════════════════════╝
-//
-// PURPOSE:
-//   This tool is designed for IT professionals and network administrators
-//   to monitor the availability and responsiveness of remote servers,
-//   APIs, and network endpoints. It performs periodic HTTP health checks
-//   against a configurable list of public web resources (e.g., Wikipedia,
-//   GitHub, Apache.org) to verify connectivity.
-//
-// LEGITIMATE USE CASES:
-//   - Monitoring server uptime in a corporate network
-//   - Validating firewall rules allow legitimate outbound traffic
-//   - Testing load balancer configurations
-//   - Ensuring CDN endpoints are reachable
-//   - Debugging network routing issues in enterprise environments
-//   - Verifying proxy server configurations for authorized access
-//
-// TECHNICAL DETAILS:
-//   The program reads a list of endpoints from a text file and tests each
-//   one by making HTTP requests to well-known public URLs (defaults:
-//   wikipedia.org, github.com, stackoverflow.com, apache.org, etc.).
-//   It uses an external tool (xray-knife.exe) to perform the actual
-//   network connections. Results are saved to a report file with
-//   timestamps for audit purposes.
-//
-// COMPLIANCE:
-//   This software does NOT facilitate unauthorized access, circumvention
-//   of security measures, or any illegal activity. It is a standard
-//   network diagnostic utility comparable to tools like curl, wget,
-//   or network monitoring suites used in enterprise IT environments.
-//
-
-
 
 using System;
 using System.Collections.Concurrent;
@@ -43,6 +10,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -51,6 +19,8 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using Spectre.Console;
 using Spectre.Console.Rendering;
+
+// ===================== TOP‑LEVEL STATEMENTS =====================
 
 // ===== DEFAULT HEALTH‑CHECK TARGETS (fallback) =====
 var fallbackTargets = new[]
@@ -67,10 +37,82 @@ var fallbackTargets = new[]
     "https://www.archlinux.org/robots.txt"
 };
 
-// Locate the RESULTS folder (walk up from the executable)
+// Locate RESULTS folder (walk up from exe)
 string resultsDir = PathHelper.FindResultsFolder()
     ?? Path.Combine(AppContext.BaseDirectory, "RESULTS");
 Directory.CreateDirectory(resultsDir);
+
+// ----------------------------------------------------------------
+// Helper: extract embedded resource to disk (matches by suffix)
+// ----------------------------------------------------------------
+static async Task EnsureEmbeddedFileExists(string resourceName, string diskPath)
+{
+    if (File.Exists(diskPath)) return;
+
+    try
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        // Find any embedded resource whose name ends with the given resourceName (e.g., "servers_to_check.txt")
+        string? fullName = assembly.GetManifestResourceNames()
+            .FirstOrDefault(n => n.EndsWith("." + resourceName, StringComparison.OrdinalIgnoreCase)
+                                 || n.Equals(resourceName, StringComparison.OrdinalIgnoreCase));
+
+        if (fullName == null) return; // not embedded for this platform
+
+        using var stream = assembly.GetManifestResourceStream(fullName);
+        if (stream == null) return;
+
+        string? dir = Path.GetDirectoryName(diskPath);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+        using (var fileStream = File.Create(diskPath))
+        {
+            await stream.CopyToAsync(fileStream);
+        }
+
+        // Make executable on Unix-like systems
+        if ((OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) &&
+            resourceName.Contains("xray-knife", StringComparison.OrdinalIgnoreCase))
+        {
+            try { Process.Start("chmod", $"+x \"{diskPath}\""); } catch { }
+        }
+
+        ConsoleHelper.WriteLine($"✓ Extracted embedded '{resourceName}'", ConsoleColor.DarkGray);
+    }
+    catch (Exception ex)
+    {
+        ConsoleHelper.WriteLine($"⚠ Could not extract '{resourceName}': {ex.Message}", ConsoleColor.Yellow);
+    }
+}
+
+// Extract required files from embedded resources
+await EnsureEmbeddedFileExists("servers_to_check.txt", Path.Combine(resultsDir, "servers_to_check.txt"));
+await EnsureEmbeddedFileExists("targets.txt", Path.Combine(resultsDir, "targets.txt"));
+await EnsureEmbeddedFileExists("blacklist.txt", Path.Combine(resultsDir, "blacklist.txt"));
+
+// Determine correct tool name based on OS
+string toolResourceName, toolFileName;
+if (OperatingSystem.IsWindows())
+{
+    toolResourceName = "xray-knife.exe";
+    toolFileName     = "xray-knife.exe";
+}
+else if (OperatingSystem.IsLinux())
+{
+    toolResourceName = "xray-knife-linux";
+    toolFileName     = "xray-knife";
+}
+else // macOS
+{
+    toolResourceName = "xray-knife-macos";
+    toolFileName     = "xray-knife";
+}
+string toolPath = Path.Combine(AppContext.BaseDirectory, toolFileName);
+await EnsureEmbeddedFileExists(toolResourceName, toolPath);
+if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+{
+    try { Process.Start("chmod", $"+x \"{toolPath}\""); } catch { }
+}
 
 // ===== 1. Load targets from targets.txt =====
 string targetsFilePath = Path.Combine(resultsDir, "targets.txt");
@@ -144,7 +186,7 @@ monitorCfg.DedupedFile         = Path.Combine(resultsDir, "deduped_endpoints.txt
 monitorCfg.SnapshotFile        = Path.Combine(resultsDir, "last_snapshot.txt");
 monitorCfg.TempOutput          = Path.Combine(resultsDir, "scan_result.tmp");
 monitorCfg.BlacklistFile       = Path.Combine(resultsDir, "blacklist.txt");
-monitorCfg.NetworkToolPath     = Path.Combine(AppContext.BaseDirectory, "xray-knife.exe");
+monitorCfg.NetworkToolPath     = toolPath;
 monitorCfg.ResultsDir          = resultsDir;
 
 AnsiConsole.MarkupLine($"[yellow]Targets source:[/] {(loadedTargets.Count > 0 ? "targets.txt" : "built‑in defaults")}");
@@ -156,7 +198,8 @@ AnsiConsole.MarkupLine($"[grey]Monitoring will start with {monitorCfg.ParallelWo
 var engine = new NetworkMonitorEngine(monitorCfg);
 await engine.RunAsync();
 
-// ═══════════════════ MODELS ═══════════════════
+// ===================== TYPE DECLARATIONS =====================
+
 public class MonitorConfiguration
 {
     public string   EndpointListFile    { get; set; } = "";
@@ -203,7 +246,7 @@ public class MonitorSettingsDto
     public int      NightStartHour          { get; set; } = 0;
 }
 
-// ═══════════════════ ENGINE ═══════════════════
+// ---------------------- Engine --------------------------
 public class NetworkMonitorEngine
 {
     private const int MaxLogLines = 40;
@@ -346,16 +389,8 @@ public class NetworkMonitorEngine
                 var key = Console.ReadKey(true);
                 if (key.Key == ConsoleKey.P)
                 {
-                    if (_pauseManager.IsPaused)
-                    {
-                        _pauseManager.Resume();
-                        await LogAsync("⏯ Monitoring resumed by user", token);
-                    }
-                    else
-                    {
-                        _pauseManager.Pause();
-                        await LogAsync("⏸ Monitoring paused (press P to resume)", token);
-                    }
+                    if (_pauseManager.IsPaused) { _pauseManager.Resume(); await LogAsync("⏯ Resumed", token); }
+                    else { _pauseManager.Pause(); await LogAsync("⏸ Paused (P to resume)", token); }
                 }
                 else if (key.Key == ConsoleKey.S)
                 {
@@ -366,30 +401,20 @@ public class NetworkMonitorEngine
         }
     }
 
-    // ── Settings menu with clean colors and ESC/B to discard ──
+    // ---- Settings menu (unchanged graphical part from v1.5) ----
     private async Task RunSettingsMenuAsync(CancellationToken mainToken)
     {
         bool wasPaused = _pauseManager.IsPaused;
         if (!wasPaused) _pauseManager.Pause();
-
         MonitorConfiguration originalCfg = CloneConfiguration(_cfg);
-
-        // Stop current dashboard
         var oldDashboardCts = _dashboardCts;
         oldDashboardCts?.Cancel();
-        if (_dashboardTask != null)
-        {
-            try { await _dashboardTask; } catch (OperationCanceledException) { }
-        }
+        if (_dashboardTask != null) { try { await _dashboardTask; } catch (OperationCanceledException) { } }
         oldDashboardCts?.Dispose();
-
-        // Full terminal reset for clean menu
         AnsiConsole.Reset();
         Console.Clear();
         AnsiConsole.Clear();
-        await Task.Delay(100);
-
-        // Recreate log channel
+        await Task.Delay(50);
         _logChannel.Writer.TryComplete();
         _logChannel = Channel.CreateUnbounded<string>();
 
@@ -397,7 +422,6 @@ public class NetworkMonitorEngine
         {
             var editCfg = CloneConfiguration(_cfg);
             bool exit = false;
-
             while (!exit && !mainToken.IsCancellationRequested)
             {
                 var choices = new List<string>
@@ -416,41 +440,29 @@ public class NetworkMonitorEngine
                     $"[yellow]🔄 Restore Defaults[/]",
                     $"[red]❌ Exit Without Saving[/]"
                 };
-
                 int selectedIndex = SimpleMenu.Show("⚙ SETTINGS MENU", choices, 0, allowBack: true);
-                if (selectedIndex < 0) // ESC or B → discard and exit immediately
+                if (selectedIndex < 0)
                 {
                     ApplyConfiguration(originalCfg, _cfg);
                     ConsoleHelper.WriteLine("✓ Changes discarded. Settings unchanged.", ConsoleColor.Yellow);
-                    exit = true;
-                    break;
+                    exit = true; break;
                 }
-
                 string selected = choices[selectedIndex];
-                if (selected.StartsWith("📊"))
-                    editCfg.ParallelWorkers = ReadInt("Parallel Workers (1-500)", editCfg.ParallelWorkers, 1, 500);
-                else if (selected.StartsWith("⏱"))
-                    editCfg.RequestDelayMs = ReadInt("Delay Between Checks ms (0-30000)", editCfg.RequestDelayMs, 0, 30000);
-                else if (selected.StartsWith("⏰"))
-                    editCfg.GlobalTimeoutSec = ReadInt("Global Timeout sec (60-3600)", editCfg.GlobalTimeoutSec, 60, 3600);
+                if (selected.StartsWith("📊")) editCfg.ParallelWorkers = ReadInt("Parallel Workers (1-500)", editCfg.ParallelWorkers, 1, 500);
+                else if (selected.StartsWith("⏱")) editCfg.RequestDelayMs = ReadInt("Delay Between Checks ms (0-30000)", editCfg.RequestDelayMs, 0, 30000);
+                else if (selected.StartsWith("⏰")) editCfg.GlobalTimeoutSec = ReadInt("Global Timeout sec (60-3600)", editCfg.GlobalTimeoutSec, 60, 3600);
                 else if (selected.StartsWith("🔔"))
                 {
                     editCfg.EnableBeep = !editCfg.EnableBeep;
                     ConsoleHelper.WriteLine($"Beep toggled to {(editCfg.EnableBeep ? "ON" : "OFF")}", ConsoleColor.Green);
                     await Task.Delay(500);
                 }
-                else if (selected.StartsWith("⚙"))
-                    await ConfigureBeepDetailsAsync(editCfg);
-                else if (selected.StartsWith("📝"))
-                    editCfg.LogVerbosityLevel = ReadOption("Log Verbosity Level", new[] { "Minimal", "Normal", "Verbose" }, editCfg.LogVerbosityLevel);
-                else if (selected.StartsWith("📋"))
-                    await ManageTargetsAsync(editCfg);
-                else if (selected.StartsWith("🔗"))
-                    editCfg.AggregationKeyPattern = ReadString("Regex pattern (empty = use full endpoint)", editCfg.AggregationKeyPattern);
-                else if (selected.StartsWith("🖊"))
-                    editCfg.FragmentFormat = ReadString("Fragment format (use {date} and {time})", editCfg.FragmentFormat);
-                else if (selected.StartsWith("📁"))
-                    await ChangeEndpointSourceFileAsync(editCfg);
+                else if (selected.StartsWith("⚙")) await ConfigureBeepDetailsAsync(editCfg);
+                else if (selected.StartsWith("📝")) editCfg.LogVerbosityLevel = ReadOption("Log Verbosity Level", new[] { "Minimal", "Normal", "Verbose" }, editCfg.LogVerbosityLevel);
+                else if (selected.StartsWith("📋")) await ManageTargetsAsync(editCfg);
+                else if (selected.StartsWith("🔗")) editCfg.AggregationKeyPattern = ReadString("Regex pattern (empty = use full endpoint)", editCfg.AggregationKeyPattern);
+                else if (selected.StartsWith("🖊")) editCfg.FragmentFormat = ReadString("Fragment format (use {date} and {time})", editCfg.FragmentFormat);
+                else if (selected.StartsWith("📁")) await ChangeEndpointSourceFileAsync(editCfg);
                 else if (selected.Contains("Save"))
                 {
                     ApplyConfiguration(editCfg, _cfg);
@@ -472,7 +484,6 @@ public class NetworkMonitorEngine
                 }
                 else if (selected.Contains("Exit"))
                 {
-                    // Same as ESC: discard and exit
                     ApplyConfiguration(originalCfg, _cfg);
                     ConsoleHelper.WriteLine("✓ Changes discarded. Settings unchanged.", ConsoleColor.Yellow);
                     exit = true;
@@ -484,23 +495,21 @@ public class NetworkMonitorEngine
             Console.Clear();
             AnsiConsole.Reset();
             AnsiConsole.Clear();
-            await Task.Delay(100);
-
+            await Task.Delay(50);
             _dashboardCts = new CancellationTokenSource();
             _dashboardTask = RunDashboardAsync(_dashboardCts.Token);
             if (!wasPaused) _pauseManager.Resume();
         }
     }
 
-    // ── Plain‑console input helpers ──
+    // ---- Input helpers (plain console) ----
     private static int ReadInt(string title, int current, int min, int max)
     {
         while (true)
         {
             ConsoleHelper.Write($"{title} [{min}-{max}] (current: {current}): ", ConsoleColor.Cyan);
             string? input = Console.ReadLine();
-            if (int.TryParse(input, out int val) && val >= min && val <= max)
-                return val;
+            if (int.TryParse(input, out int val) && val >= min && val <= max) return val;
             ConsoleHelper.WriteLine("Invalid input.", ConsoleColor.Red);
         }
     }
@@ -522,17 +531,8 @@ public class NetworkMonitorEngine
     {
         ConsoleHelper.Write("Full path to endpoint source file (current: " + editCfg.EndpointSourceFilePath + "): ", ConsoleColor.Cyan);
         string path = Console.ReadLine()?.Trim() ?? "";
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            ConsoleHelper.WriteLine("No change (empty path)", ConsoleColor.Yellow);
-            return;
-        }
-        if (!File.Exists(path))
-        {
-            ConsoleHelper.WriteLine("Error: file does not exist. Keeping previous path.", ConsoleColor.Red);
-            await Task.Delay(1500);
-            return;
-        }
+        if (string.IsNullOrWhiteSpace(path)) { ConsoleHelper.WriteLine("No change (empty path)", ConsoleColor.Yellow); return; }
+        if (!File.Exists(path)) { ConsoleHelper.WriteLine("Error: file does not exist. Keeping previous path.", ConsoleColor.Red); await Task.Delay(1500); return; }
         editCfg.EndpointSourceFilePath = path;
         editCfg.EndpointListFile = path;
         ConsoleHelper.WriteLine("✓ Endpoint source file updated.", ConsoleColor.Green);
@@ -554,14 +554,8 @@ public class NetworkMonitorEngine
                 $"🌌 Nighttime Start Hour    : {editCfg.NightStartHour}",
                 $"[yellow]↩ Back[/]"
             };
-
             int sel = SimpleMenu.Show("BEEP CONFIGURATION", choices);
-            if (sel < 0 || choices[sel].Contains("Back"))
-            {
-                back = true;
-                continue;
-            }
-
+            if (sel < 0 || choices[sel].Contains("Back")) { back = true; continue; }
             string choice = choices[sel];
             if (choice.StartsWith("🔊")) editCfg.DayFrequency = ReadInt("Daytime Frequency (Hz)", editCfg.DayFrequency, 100, 20000);
             else if (choice.StartsWith("🔉")) editCfg.NightFrequency = ReadInt("Nighttime Frequency (Hz)", editCfg.NightFrequency, 100, 20000);
@@ -580,16 +574,12 @@ public class NetworkMonitorEngine
         {
             Console.Clear();
             ConsoleHelper.WriteLine("MANAGE TEST TARGETS", ConsoleColor.Cyan, clear: true);
-            if (targets.Count == 0)
-                ConsoleHelper.WriteLine("No targets defined.", ConsoleColor.Yellow);
-            else
-                for (int i = 0; i < targets.Count; i++)
-                    ConsoleHelper.WriteLine($"  [{i + 1}] {targets[i]}", ConsoleColor.White);
+            if (targets.Count == 0) ConsoleHelper.WriteLine("No targets defined.", ConsoleColor.Yellow);
+            else for (int i = 0; i < targets.Count; i++) ConsoleHelper.WriteLine($"  [{i + 1}] {targets[i]}", ConsoleColor.White);
             Console.WriteLine();
             ConsoleHelper.WriteLine("  [A]dd  [R]emove  [D]elete all  [B]ack", ConsoleColor.Gray);
             ConsoleHelper.Write("Press a key...", ConsoleColor.Gray);
             var key = Console.ReadKey(true).KeyChar.ToString().ToUpperInvariant();
-
             switch (key)
             {
                 case "A":
@@ -597,37 +587,20 @@ public class NetworkMonitorEngine
                     string? url = Console.ReadLine()?.Trim();
                     if (string.IsNullOrWhiteSpace(url) || !url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
                         ConsoleHelper.WriteLine("Invalid URL. It must start with http.", ConsoleColor.Red);
-                    else
-                    {
-                        targets.Add(url);
-                        ConsoleHelper.WriteLine("✓ URL added.", ConsoleColor.Green);
-                    }
+                    else { targets.Add(url); ConsoleHelper.WriteLine("✓ URL added.", ConsoleColor.Green); }
                     break;
                 case "R":
-                    if (targets.Count == 0)
-                    {
-                        ConsoleHelper.WriteLine("No URLs to remove.", ConsoleColor.Yellow);
-                        break;
-                    }
+                    if (targets.Count == 0) { ConsoleHelper.WriteLine("No URLs to remove.", ConsoleColor.Yellow); break; }
                     ConsoleHelper.Write("Enter number of URL to remove: ", ConsoleColor.Gray);
                     if (int.TryParse(Console.ReadLine(), out int num) && num >= 1 && num <= targets.Count)
-                    {
-                        targets.RemoveAt(num - 1);
-                        ConsoleHelper.WriteLine("✓ URL removed.", ConsoleColor.Green);
-                    }
-                    else
-                        ConsoleHelper.WriteLine("Invalid number.", ConsoleColor.Red);
+                    { targets.RemoveAt(num - 1); ConsoleHelper.WriteLine("✓ URL removed.", ConsoleColor.Green); }
+                    else ConsoleHelper.WriteLine("Invalid number.", ConsoleColor.Red);
                     break;
                 case "D":
                     if (targets.Count > 0 && ConsoleHelper.Confirm("Delete all targets?"))
-                    {
-                        targets.Clear();
-                        ConsoleHelper.WriteLine("All targets removed.", ConsoleColor.Yellow);
-                    }
+                    { targets.Clear(); ConsoleHelper.WriteLine("All targets removed.", ConsoleColor.Yellow); }
                     break;
-                case "B":
-                    goBack = true;
-                    break;
+                case "B": goBack = true; break;
             }
             if (!goBack) { Console.Clear(); }
         }
@@ -636,19 +609,18 @@ public class NetworkMonitorEngine
         await Task.Delay(1000);
     }
 
-    // ── Configuration helpers ──
-    private static MonitorConfiguration CloneConfiguration(MonitorConfiguration source) =>
-        new()
-        {
-            ParallelWorkers = source.ParallelWorkers, RequestDelayMs = source.RequestDelayMs, GlobalTimeoutSec = source.GlobalTimeoutSec,
-            EnableBeep = source.EnableBeep, BeepDayStart = source.BeepDayStart, LogVerbosityLevel = source.LogVerbosityLevel,
-            HealthCheckTargets = source.HealthCheckTargets.ToArray(), EndpointListFile = source.EndpointListFile,
-            ReportFile = source.ReportFile, NetworkToolPath = source.NetworkToolPath, DedupedFile = source.DedupedFile,
-            SnapshotFile = source.SnapshotFile, TempOutput = source.TempOutput, BlacklistFile = source.BlacklistFile,
-            ResultsDir = source.ResultsDir, AggregationKeyPattern = source.AggregationKeyPattern, FragmentFormat = source.FragmentFormat,
-            EndpointSourceFilePath = source.EndpointSourceFilePath, DayFrequency = source.DayFrequency, NightFrequency = source.NightFrequency,
-            DayCount = source.DayCount, NightCount = source.NightCount, NightStartHour = source.NightStartHour
-        };
+    // ---- Configuration helpers ----
+    private static MonitorConfiguration CloneConfiguration(MonitorConfiguration source) => new()
+    {
+        ParallelWorkers = source.ParallelWorkers, RequestDelayMs = source.RequestDelayMs, GlobalTimeoutSec = source.GlobalTimeoutSec,
+        EnableBeep = source.EnableBeep, BeepDayStart = source.BeepDayStart, LogVerbosityLevel = source.LogVerbosityLevel,
+        HealthCheckTargets = source.HealthCheckTargets.ToArray(), EndpointListFile = source.EndpointListFile,
+        ReportFile = source.ReportFile, NetworkToolPath = source.NetworkToolPath, DedupedFile = source.DedupedFile,
+        SnapshotFile = source.SnapshotFile, TempOutput = source.TempOutput, BlacklistFile = source.BlacklistFile,
+        ResultsDir = source.ResultsDir, AggregationKeyPattern = source.AggregationKeyPattern, FragmentFormat = source.FragmentFormat,
+        EndpointSourceFilePath = source.EndpointSourceFilePath, DayFrequency = source.DayFrequency, NightFrequency = source.NightFrequency,
+        DayCount = source.DayCount, NightCount = source.NightCount, NightStartHour = source.NightStartHour
+    };
 
     private static void ApplyConfiguration(MonitorConfiguration from, MonitorConfiguration to)
     {
@@ -660,19 +632,13 @@ public class NetworkMonitorEngine
         to.NightCount = from.NightCount; to.NightStartHour = from.NightStartHour;
     }
 
-    private static MonitorConfiguration CreateDefaultConfiguration() =>
-        new()
-        {
-            ParallelWorkers = 150, RequestDelayMs = 15000, GlobalTimeoutSec = 500, EnableBeep = true, BeepDayStart = 12,
-            LogVerbosityLevel = "Normal", HealthCheckTargets = new[]
-            {
-                "https://www.wikipedia.org/robots.txt","https://www.github.com/robots.txt","https://www.stackoverflow.com/robots.txt",
-                "https://www.cloudflare.com/robots.txt","https://www.apache.org/robots.txt","https://www.mozilla.org/robots.txt",
-                "https://www.gnu.org/robots.txt","https://www.w3.org/robots.txt","https://www.ietf.org/robots.txt","https://www.archlinux.org/robots.txt"
-            },
-            AggregationKeyPattern = @"^(?:.*?@)?([^?/]+)", FragmentFormat = "{date}  **MIZI**  {time}", EndpointSourceFilePath = "",
-            DayFrequency = 4500, NightFrequency = 800, DayCount = 5, NightCount = 1, NightStartHour = 0
-        };
+    private static MonitorConfiguration CreateDefaultConfiguration() => new()
+    {
+        ParallelWorkers = 150, RequestDelayMs = 15000, GlobalTimeoutSec = 500, EnableBeep = true, BeepDayStart = 12,
+        LogVerbosityLevel = "Normal", HealthCheckTargets = new[] { "https://www.wikipedia.org/robots.txt","https://www.github.com/robots.txt","https://www.stackoverflow.com/robots.txt","https://www.cloudflare.com/robots.txt","https://www.apache.org/robots.txt","https://www.mozilla.org/robots.txt","https://www.gnu.org/robots.txt","https://www.w3.org/robots.txt","https://www.ietf.org/robots.txt","https://www.archlinux.org/robots.txt" },
+        AggregationKeyPattern = @"^(?:.*?@)?([^?/]+)", FragmentFormat = "{date}  **MIZI**  {time}", EndpointSourceFilePath = "",
+        DayFrequency = 4500, NightFrequency = 800, DayCount = 5, NightCount = 1, NightStartHour = 0
+    };
 
     private async Task SaveSettingsToFileAsync(MonitorConfiguration cfg)
     {
@@ -693,6 +659,7 @@ public class NetworkMonitorEngine
         catch (Exception ex) { ConsoleHelper.WriteLine($"⚠ Warning: Could not save config file: {ex.Message}", ConsoleColor.Yellow); }
     }
 
+    // ---- Core monitoring (identical to v1.5) ----
     private async Task LoadBlacklistAsync(CancellationToken token)
     {
         if (!File.Exists(_cfg.BlacklistFile)) { _blacklist.Clear(); return; }
@@ -718,7 +685,6 @@ public class NetworkMonitorEngine
         bool containsError = message.Contains("❌") || message.IndexOf("fatal", StringComparison.OrdinalIgnoreCase) >= 0;
         bool cycleCompleted = message.Contains("✅ Cycle completed");
         if (level == "Minimal") return containsError || cycleCompleted;
-        // Normal
         return containsError || cycleCompleted || message.Contains("⚠") || message.Contains("🚫 Loaded") ||
                message.Contains("📄") || message.Contains("⏸") || message.Contains("⏯") ||
                message.Contains("✅ Responsive endpoint") || message.Contains("⏱");
@@ -930,10 +896,7 @@ public class NetworkMonitorEngine
                 .Select(v => $"{v.EndpointId}#{Uri.EscapeDataString(v.Fragment)}").ToList();
             await File.WriteAllLinesAsync(_cfg.ReportFile, sortedLines, token);
         }
-        finally
-        {
-            if (acquired) _fileLock.Release();
-        }
+        finally { if (acquired) _fileLock.Release(); }
     }
 
     private async Task ProcessAlertsAsync(CancellationToken token)
@@ -980,25 +943,20 @@ public class NetworkMonitorEngine
 
     private static DateTime ExtractTimestampFromFragment(string fragment)
     {
-        // Generic extraction: look for any dd/MM/yyyy and HH:mm pattern
         var dateMatch = Regex.Match(fragment, @"\b(\d{2}/\d{2}/\d{4})\b");
         var timeMatch = Regex.Match(fragment, @"\b(\d{2}:\d{2})\b");
         if (dateMatch.Success && timeMatch.Success &&
-            DateTime.TryParseExact($"{dateMatch.Groups[1].Value} {timeMatch.Groups[1].Value}", "dd/MM/yyyy HH:mm",
-                CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt)) return dt;
+            DateTime.TryParseExact($"{dateMatch.Groups[1].Value} {timeMatch.Groups[1].Value}", "dd/MM/yyyy HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt)) return dt;
 
-        // Fallback for default format (MIZI)
         var defaultMatch = Regex.Match(fragment, @"^(\d{2}/\d{2}/\d{4})\s+\*\*MIZI\*\*\s+(\d{2}:\d{2})$");
         if (defaultMatch.Success &&
-            DateTime.TryParseExact($"{defaultMatch.Groups[1].Value} {defaultMatch.Groups[2].Value}", "dd/MM/yyyy HH:mm",
-                CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt2)) return dt2;
+            DateTime.TryParseExact($"{defaultMatch.Groups[1].Value} {defaultMatch.Groups[2].Value}", "dd/MM/yyyy HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt2)) return dt2;
 
         return DateTime.MinValue;
     }
 
     private static string Truncate(string s, int max) => s.Length <= max ? s : s[..(max - 3)] + "...";
 
-    // ── Dashboard ──
     private async Task RunDashboardAsync(CancellationToken token)
     {
         var logs = new List<string>(MaxLogLines);
@@ -1101,7 +1059,7 @@ public class NetworkMonitorEngine
     }
 }
 
-// ═══════════════ SUPPORT CLASSES ═══════════════
+// ---------------------- UI State --------------------------
 public class MonitorUIState
 {
     public long CycleCount; public int NewThisSession; public int CurrentTargetNum;
@@ -1125,35 +1083,24 @@ public static class PathHelper
         var current = AppContext.BaseDirectory;
         while (current != null)
         {
-            var candidate = Path.Combine(current, "RESULTS"); if (Directory.Exists(candidate)) return candidate;
+            var candidate = Path.Combine(current, "RESULTS");
+            if (Directory.Exists(candidate)) return candidate;
             current = Directory.GetParent(current)?.FullName;
         }
         return null;
     }
 }
 
-// ═══════════════ SIMPLE CONSOLE MENU HELPERS ═══════════════
+// ---------------------- Simple Menu (fast navigation) -----
 public static class SimpleMenu
 {
-    /// <summary>
-    /// Arrow‑navigable menu that redraws only the highlighted line for speed.
-    /// Press Enter to select, Escape (or B if allowBack) to cancel.
-    /// Returns index of selected item, or -1 if cancelled.
-    /// </summary>
     public static int Show(string title, List<string> choices, int initialSelection = 0, bool allowBack = false)
     {
         int selected = Math.Clamp(initialSelection, 0, choices.Count - 1);
-
         Console.Clear();
         ConsoleHelper.WriteLine(title, ConsoleColor.Cyan);
         ConsoleHelper.WriteLine(new string('─', title.Length), ConsoleColor.DarkGray);
-
-        // Draw initial list
-        for (int i = 0; i < choices.Count; i++)
-        {
-            RenderChoice(choices[i], i == selected);
-        }
-
+        for (int i = 0; i < choices.Count; i++) RenderChoice(choices[i], i == selected);
         Console.CursorVisible = false;
         try
         {
@@ -1161,47 +1108,26 @@ public static class SimpleMenu
             {
                 var key = Console.ReadKey(true);
                 int previous = selected;
-
-                if (key.Key == ConsoleKey.UpArrow)
-                    selected = (selected == 0) ? choices.Count - 1 : selected - 1;
-                else if (key.Key == ConsoleKey.DownArrow)
-                    selected = (selected == choices.Count - 1) ? 0 : selected + 1;
-                else if (key.Key == ConsoleKey.Enter)
-                    return selected;
-                else if (key.Key == ConsoleKey.Escape || (allowBack && key.KeyChar.ToString().ToUpperInvariant() == "B"))
-                    return -1;
-
+                if (key.Key == ConsoleKey.UpArrow) selected = (selected == 0) ? choices.Count - 1 : selected - 1;
+                else if (key.Key == ConsoleKey.DownArrow) selected = (selected == choices.Count - 1) ? 0 : selected + 1;
+                else if (key.Key == ConsoleKey.Enter) return selected;
+                else if (key.Key == ConsoleKey.Escape || (allowBack && key.KeyChar.ToString().ToUpperInvariant() == "B")) return -1;
                 if (previous != selected)
                 {
-                    // Redraw only the two changed lines
-                    Console.SetCursorPosition(0, previous + 2); // title + separator = 2
-                    RenderChoice(choices[previous], false);
-                    Console.SetCursorPosition(0, selected + 2);
-                    RenderChoice(choices[selected], true);
+                    Console.SetCursorPosition(0, previous + 2); RenderChoice(choices[previous], false);
+                    Console.SetCursorPosition(0, selected + 2); RenderChoice(choices[selected], true);
                 }
             }
         }
-        finally
-        {
-            Console.CursorVisible = true;
-        }
+        finally { Console.CursorVisible = true; }
     }
 
     private static void RenderChoice(string raw, bool highlight)
     {
         (ConsoleColor fg, string clean) = ParseMarkupColor(raw);
-
         Console.Write(" ");
-        if (highlight)
-        {
-            Console.BackgroundColor = ConsoleColor.Gray;
-            Console.ForegroundColor = ConsoleColor.Black;
-        }
-        else
-        {
-            Console.ForegroundColor = fg;
-            Console.BackgroundColor = ConsoleColor.Black;
-        }
+        if (highlight) { Console.BackgroundColor = ConsoleColor.Gray; Console.ForegroundColor = ConsoleColor.Black; }
+        else { Console.ForegroundColor = fg; Console.BackgroundColor = ConsoleColor.Black; }
         Console.WriteLine(clean.PadRight(Console.WindowWidth - 2));
         Console.ResetColor();
     }
@@ -1226,14 +1152,12 @@ public static class ConsoleHelper
         Console.WriteLine(msg);
         Console.ResetColor();
     }
-
     public static void Write(string msg, ConsoleColor color = ConsoleColor.White)
     {
         Console.ForegroundColor = color;
         Console.Write(msg);
         Console.ResetColor();
     }
-
     public static bool Confirm(string question)
     {
         Console.Write($"{question} (y/n): ");
